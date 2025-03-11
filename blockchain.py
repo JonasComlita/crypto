@@ -11,6 +11,7 @@ import ecdsa
 from logging.handlers import RotatingFileHandler
 from prometheus_client import Counter, Gauge
 from utils import SecurityUtils, TransactionInput, TransactionOutput, TransactionType
+from collections import defaultdict
 
 handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
 logging.basicConfig(level=logging.INFO, handlers=[handler])
@@ -362,6 +363,28 @@ class Miner:
                     start_time = time.time()
             return False
 
+class NonceTracker:
+    def __init__(self):
+        self.nonce_map = defaultdict(set)
+        self.nonce_expiry = {}  # Store block height when nonce was used
+        
+    async def add_nonce(self, address: str, nonce: int, block_height: int):
+        self.nonce_map[address].add(nonce)
+        self.nonce_expiry[(address, nonce)] = block_height
+        
+    async def is_nonce_used(self, address: str, nonce: int) -> bool:
+        return nonce in self.nonce_map[address]
+    
+    async def cleanup_old_nonces(self, current_height: int, retention_blocks: int = 10000):
+        """Remove nonces older than retention_blocks"""
+        expired = [(addr, nonce) for (addr, nonce), height 
+                  in self.nonce_expiry.items() 
+                  if current_height - height > retention_blocks]
+        
+        for addr, nonce in expired:
+            self.nonce_map[addr].remove(nonce)
+            del self.nonce_expiry[(addr, nonce)]
+
 class Blockchain:
     def __init__(self, storage_path: str = "chain.db"):
         self.chain: List[Block] = []
@@ -379,6 +402,7 @@ class Blockchain:
         self.block_height = Gauge('blockchain_height', 'Current height of the blockchain')
         self.checkpoint_interval = 100
         self.checkpoints = [0]
+        self.nonce_tracker = NonceTracker()
         # Do not call load_chain() here; defer to async init
 
     async def initialize(self) -> None:

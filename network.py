@@ -13,6 +13,9 @@ from collections import defaultdict
 from blockchain import Blockchain, Block, Transaction
 from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth
 from prometheus_client import Counter, Gauge
+from utils import SecurityUtils
+from security.monitor import SecurityMonitor
+from security.mfa import MFAManager
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
@@ -40,6 +43,77 @@ async def rate_limit_middleware(app: aiohttp.web.Application, handler: callable)
         return await handler(request)
     return middleware
 
+class PeerReputation:
+    def __init__(self):
+        self.reputation_scores = defaultdict(lambda: 100)  # Start with 100 points
+        self.violation_weights = {
+            'invalid_transaction': -10,
+            'invalid_block': -20,
+            'failed_auth': -15,
+            'rate_limit_exceeded': -5,
+            'successful_transaction': 1,
+            'successful_block': 2
+        }
+        
+    def update_reputation(self, peer_id: str, event: str) -> int:
+        """Update peer reputation based on events"""
+        self.reputation_scores[peer_id] += self.violation_weights.get(event, 0)
+        self.reputation_scores[peer_id] = max(0, min(100, self.reputation_scores[peer_id]))
+        return self.reputation_scores[peer_id]
+    
+    def is_peer_trusted(self, peer_id: str, minimum_score: int = 50) -> bool:
+        return self.reputation_scores[peer_id] >= minimum_score
+
+class RateLimiter:
+    def __init__(self):
+        self.request_counts = defaultdict(lambda: defaultdict(int))
+        self.last_reset = defaultdict(float)
+        
+        # Configure limits for different operations
+        self.limits = {
+            'transaction': {'count': 100, 'window': 60},  # 100 transactions per minute
+            'block': {'count': 10, 'window': 60},        # 10 blocks per minute
+            'peer_connect': {'count': 5, 'window': 60},  # 5 connection attempts per minute
+        }
+
+    async def check_rate_limit(self, peer_id: str, operation: str) -> bool:
+        current_time = time.time()
+        window = self.limits[operation]['window']
+        
+        # Reset counters if window has passed
+        if current_time - self.last_reset[peer_id] > window:
+            self.request_counts[peer_id] = defaultdict(int)
+            self.last_reset[peer_id] = current_time
+        
+        # Check if limit is exceeded
+        if self.request_counts[peer_id][operation] >= self.limits[operation]['count']:
+            return False
+        
+        self.request_counts[peer_id][operation] += 1
+        return True
+
+class NonceTracker:
+    def __init__(self):
+        self.nonce_map = defaultdict(set)
+        self.nonce_expiry = {}  # Store block height when nonce was used
+        
+    async def add_nonce(self, address: str, nonce: int, block_height: int):
+        self.nonce_map[address].add(nonce)
+        self.nonce_expiry[(address, nonce)] = block_height
+        
+    async def is_nonce_used(self, address: str, nonce: int) -> bool:
+        return nonce in self.nonce_map[address]
+    
+    async def cleanup_old_nonces(self, current_height: int, retention_blocks: int = 10000):
+        """Remove nonces older than retention_blocks"""
+        expired = [(addr, nonce) for (addr, nonce), height 
+                  in self.nonce_expiry.items() 
+                  if current_height - height > retention_blocks]
+        
+        for addr, nonce in expired:
+            self.nonce_map[addr].remove(nonce)
+            del self.nonce_expiry[(addr, nonce)]
+
 class BlockchainNetwork:
     """Manages peer-to-peer networking for the blockchain with enhanced security and reliability."""
     def __init__(self, blockchain: 'Blockchain', node_id: str, host: str, port: int, 
@@ -63,6 +137,12 @@ class BlockchainNetwork:
         self.start_time = time.time()
         self._lock = asyncio.Lock()
         self.active_requests = Gauge('active_peer_requests', 'Number of active requests to peers')
+        self.peer_reputation = PeerReputation()
+        self.rate_limiter = RateLimiter()
+        self.nonce_tracker = NonceTracker()
+        self.security_monitor = SecurityMonitor()
+        self.mfa_manager = MFAManager()
+        asyncio.create_task(self.security_monitor.analyze_patterns())
 
     def _setup_routes(self) -> None:
         """Configure HTTP routes for the network."""
@@ -470,3 +550,39 @@ class BlockchainNetwork:
             pass
         except Exception as e:
             logger.error(f"Task failed: {e}")
+
+    async def handle_transaction(self, transaction, peer_id):
+        # Check rate limit
+        if not await self.rate_limiter.check_rate_limit(peer_id, 'transaction'):
+            self.peer_reputation.update_reputation(peer_id, 'rate_limit_exceeded')
+            return False
+            
+        # Check peer reputation
+        if not self.peer_reputation.is_peer_trusted(peer_id):
+            logger.warning(f"Rejecting transaction from untrusted peer {peer_id}")
+            return False
+            
+        # Check for replay attacks
+        if await self.nonce_tracker.is_nonce_used(
+            SecurityUtils.public_key_to_address(transaction.inputs[0].public_key),
+            transaction.nonce
+        ):
+            self.peer_reputation.update_reputation(peer_id, 'invalid_transaction')
+            return False
+            
+        # ... rest of transaction handling ...
+
+    async def handle_connection(self, ip: str):
+        if not await self.security_monitor.monitor_connection(ip):
+            logger.warning(f"Rejected connection from {ip}")
+            return False
+        return True
+        
+    async def handle_critical_operation(self, user_id: str, operation: str, mfa_token: Optional[str] = None):
+        """Handle operations that require MFA"""
+        if operation in ['key_rotation', 'validator_update', 'network_config']:
+            if not mfa_token or not await self.mfa_manager.verify_mfa(user_id, mfa_token):
+                logger.error(f"MFA verification failed for {operation} by {user_id}")
+                await self.security_monitor.record_failed_attempt(user_id, 'mfa_failure')
+                return False
+        return True

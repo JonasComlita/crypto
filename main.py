@@ -10,9 +10,17 @@ from utils import find_available_port, init_rotation_manager
 from gui import BlockchainGUI
 import threading
 import aiohttp
+from threading import Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def create_ssl_context():
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = True
+    ssl_context.minimum_version = ssl.TLSVersion.TLS1_2
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    return ssl_context
 
 async def health_check(host: str, port: int, client_ssl_context, retries: int = 5, delay: float = 1.0) -> bool:
     try:
@@ -31,27 +39,105 @@ async def health_check(host: str, port: int, client_ssl_context, retries: int = 
         return False
 
 def shutdown(gui: BlockchainGUI, network: BlockchainNetwork, rotation_manager, loop: asyncio.AbstractEventLoop):
-    logger.info("Shutting down...")
-    gui.exit()
-    asyncio.run_coroutine_threadsafe(network.stop(), network.loop)
-    asyncio.run_coroutine_threadsafe(rotation_manager.stop(), loop)
-    loop.stop()
+    logger.info("Initiating graceful shutdown...")
+    try:
+        # Set shutdown flag
+        network.shutdown_flag = True
+        
+        # Stop GUI
+        gui.exit()
+        
+        # Stop network operations
+        shutdown_task = asyncio.run_coroutine_threadsafe(
+            network.stop(), 
+            network.loop
+        )
+        shutdown_task.result(timeout=5)  # Wait up to 5 seconds
+        
+        # Stop rotation manager
+        rotation_task = asyncio.run_coroutine_threadsafe(
+            rotation_manager.stop(), 
+            loop
+        )
+        rotation_task.result(timeout=5)
+        
+        # Cancel all pending tasks
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        
+        loop.stop()
+        logger.info("Shutdown completed successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
+        sys.exit(1)
 
 async def run_async_tasks(gui: BlockchainGUI, network: BlockchainNetwork, rotation_manager, loop: asyncio.AbstractEventLoop):
-    """Run initial async setup tasks."""
-    port = network.port
-    await asyncio.sleep(2)
-    if not await health_check(network.host, network.port, network.client_ssl_context):
-        logger.error("Health check failed after retries, exiting...")
+    try:
+        port = network.port
+        await asyncio.sleep(2)
+        if not await health_check(network.host, network.port, network.client_ssl_context):
+            logger.error("Health check failed after retries, exiting...")
+            await network.cleanup()
+            gui.root.quit()
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Critical error in async tasks: {e}", exc_info=True)
+        await network.cleanup()
         gui.root.quit()
         sys.exit(1)
 
+class ThreadSafeBlockchain:
+    def __init__(self):
+        self._lock = Lock()
+        self._blockchain = Blockchain()
+    
+    async def safe_operation(self, operation):
+        with self._lock:
+            return await operation(self._blockchain)
+
+def validate_port(port: int) -> bool:
+    return isinstance(port, int) and 1024 <= port <= 65535
+
+def validate_bootstrap_nodes(nodes_str: str) -> bool:
+    try:
+        nodes = nodes_str.split(",")
+        for node in nodes:
+            host, port = node.split(":")
+            if not (validate_port(int(port)) and len(host) > 0):
+                return False
+        return True
+    except:
+        return False
+
+def set_resource_limits():
+    import resource
+    # Set maximum memory usage (e.g., 2GB)
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024 * 1024 * 1024, hard))
+    
+    # Set maximum number of open files
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+
 def main():
+    # Add resource limits before any other initialization
+    set_resource_limits()
+    
     parser = argparse.ArgumentParser(description="Run a blockchain node.")
-    parser.add_argument("--port", type=int, default=None, help="Port to run the node on")
-    parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
-    parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")
+    parser.add_argument("--port", type=int, default=None, help="Port to run the node on (1024-65535)")
+    parser.add_argument("--bootstrap", type=str, default=None, 
+                       help="Comma-separated list of bootstrap nodes (host:port)")
+    parser.add_argument("--validator", action="store_true", 
+                       help="Run as validator node for key rotation")
     args = parser.parse_args()
+
+    if args.port and not validate_port(args.port):
+        logger.error("Invalid port number")
+        sys.exit(1)
+
+    if args.bootstrap and not validate_bootstrap_nodes(args.bootstrap):
+        logger.error("Invalid bootstrap nodes format")
+        sys.exit(1)
 
     port = args.port if args.port else find_available_port()
     api_port = port + 1000
