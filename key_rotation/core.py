@@ -1,9 +1,13 @@
+import sys
+import os
+print("core.py sys.path:", sys.path)
+print("core.py current directory:", os.getcwd())
+
 import asyncio
 import base64
 import hashlib
 import json
 import logging
-import os
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -14,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
 from aiohttp import ClientSession, ClientTimeout
+from security import KeyBackupManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -465,9 +470,10 @@ class P2PNetwork:
 
 class KeyRotationManager:
     """Manages secure key rotation with PKI and distributed consensus."""
-    def __init__(self, node_id: str = None, is_validator: bool = False):
-        self.node_id = node_id or str(uuid.uuid4())
+    def __init__(self, node_id: str, is_validator: bool = False, backup_manager=None):
+        self.node_id = node_id
         self.is_validator = is_validator
+        self.backup_manager = backup_manager
         self._secure_storage = SecureStorage()
         self._pki = PKIManager(self.node_id)
         self._node_registry = NodeRegistry()
@@ -673,3 +679,32 @@ class KeyRotationManager:
             except Exception as e:
                 logger.error(f"Failed to propose key rotation: {e}")
                 return None
+
+    async def rotate_keys(self):
+        """Rotate keys with automatic backup"""
+        try:
+            # ... existing key rotation logic ...
+            
+            # If backup manager is available, backup the new keys
+            if self.backup_manager:
+                try:
+                    await self.backup_manager.create_backup(
+                        keys={
+                            'public_key': self._pki.get_public_key_pem(),
+                            'private_key': self._pki.decrypt_message(await self._secure_storage.retrieve("current_auth_secret")),
+                            'rotation_time': datetime.utcnow().isoformat()
+                        },
+                        password=self.get_backup_password()
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to backup keys: {e}")
+            
+        except Exception as e:
+            logger.error(f"Key rotation failed: {e}")
+            raise
+
+    def get_backup_password(self) -> str:
+        """Get password for key backup"""
+        # In a production environment, this should be securely configured
+        # For now, we'll use a simple derived password
+        return hashlib.sha256(f"{self.node_id}_backup".encode()).hexdigest()

@@ -14,8 +14,10 @@ from blockchain import Blockchain, Block, Transaction
 from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth
 from prometheus_client import Counter, Gauge
 from utils import SecurityUtils
-from security.monitor import SecurityMonitor
+from security import SecurityMonitor
 from security.mfa import MFAManager
+import json
+import threading
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
@@ -117,32 +119,71 @@ class NonceTracker:
 class BlockchainNetwork:
     """Manages peer-to-peer networking for the blockchain with enhanced security and reliability."""
     def __init__(self, blockchain: 'Blockchain', node_id: str, host: str, port: int, 
-                 bootstrap_nodes: Optional[List[Tuple[str, int]]] = None):
+                 bootstrap_nodes: Optional[List[Tuple[str, int]]] = None, security_monitor=None):
         self.blockchain = blockchain
         self.node_id = node_id
         self.host = host
         self.port = port
         self.bootstrap_nodes = bootstrap_nodes or []
+        self.security_monitor = security_monitor
+        self.shutdown_flag = False
         self.loop = None  # Will be set in run()
         self.private_key, self.public_key = generate_node_keypair()
-        self.peers: Dict[str, Tuple[str, int, str]] = self._load_peers()
-        self.app = aiohttp.web.Application(middlewares=[rate_limit_middleware])
-        self._setup_routes()
-        self._setup_ssl_contexts()
-        self.blockchain.network = self
+        self.peers = {}  # Store active peer connections
+        self.app = web.Application(middlewares=[rate_limit_middleware])
+        self.setup_routes()
         self.sync_task: Optional[asyncio.Task] = None
         self.discovery_task: Optional[asyncio.Task] = None
         self.last_announcement = 0
         self.peer_failures: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
-        self._lock = asyncio.Lock()
+        self.lock = threading.Lock()  # Add thread lock
         self.active_requests = Gauge('active_peer_requests', 'Number of active requests to peers')
         self.peer_reputation = PeerReputation()
         self.rate_limiter = RateLimiter()
         self.nonce_tracker = NonceTracker()
-        self.security_monitor = SecurityMonitor()
         self.mfa_manager = MFAManager()
-        asyncio.create_task(self.security_monitor.analyze_patterns())
+        self.server = None  # Store server instance for cleanup
+        self.health_server = None
+        self.runner = None  # Add runner for proper web app handling
+        
+        # Initialize SSL contexts
+        self.ssl_context = None
+        self.client_ssl_context = None
+        self.init_ssl()
+
+    def init_ssl(self):
+        """Initialize SSL contexts"""
+        # Client SSL context
+        self.client_ssl_context = ssl.create_default_context()
+        self.client_ssl_context.check_hostname = False
+        self.client_ssl_context.verify_mode = ssl.CERT_NONE
+
+        # Server SSL context
+        try:
+            cert_path = f"certs/{self.node_id}.crt"
+            key_path = f"certs/{self.node_id}.key"
+            
+            if os.path.exists(cert_path) and os.path.exists(key_path):
+                self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                self.ssl_context.load_cert_chain(
+                    certfile=cert_path,
+                    keyfile=key_path
+                )
+            else:
+                logger.info("Running without HTTPS; cert or key not provided")
+                self.ssl_context = None
+        except Exception as e:
+            logger.warning(f"Failed to load SSL certificates: {e}")
+            self.ssl_context = None
+
+    def setup_routes(self):
+        """Setup API routes"""
+        self.app.router.add_get('/health', self.health_check_endpoint)
+
+    async def health_check_endpoint(self, request):
+        """Health check endpoint"""
+        return web.Response(text="OK", status=200)
 
     def _setup_routes(self) -> None:
         """Configure HTTP routes for the network."""
@@ -155,24 +196,18 @@ class BlockchainNetwork:
             web.get('/get_peers', self.get_peers)
         ])
 
-    def _setup_ssl_contexts(self) -> None:
-        """Initialize SSL contexts for server and client connections."""
-        try:
-            self.server_ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            self.server_ssl_context.load_cert_chain(certfile=CONFIG["tls_cert_file"], keyfile=CONFIG["tls_key_file"])
-            
-            self.client_ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            self.client_ssl_context.load_verify_locations(cafile=CONFIG["tls_cert_file"])
-            self.client_ssl_context.check_hostname = False  # For self-signed certs in testing
-            self.client_ssl_context.verify_mode = ssl.CERT_REQUIRED
-        except Exception as e:
-            logger.error(f"Failed to setup SSL contexts: {e}")
-            raise
-
     async def health_handler(self, request: web.Request) -> web.Response:
         """Handle health check requests."""
         logger.debug(f"Health check from {request.remote}")
         return web.Response(status=200, text="OK")
+
+    async def start(self):
+        """Start the network and security monitoring"""
+        if self.security_monitor:
+            # Start security monitoring in the correct event loop
+            asyncio.create_task(self.security_monitor.analyze_patterns())
+        
+        # ... rest of start-up code ...
 
     def run(self) -> None:
         """Start the network server and background tasks in its own event loop."""
@@ -180,19 +215,12 @@ class BlockchainNetwork:
         self.loop = asyncio.new_event_loop()  # Create a new loop for this thread
         asyncio.set_event_loop(self.loop)
         
-        runner = aiohttp.web.AppRunner(self.app)
-        self.loop.run_until_complete(runner.setup())
-        site = aiohttp.web.TCPSite(runner, self.host, self.port, ssl_context=self.server_ssl_context)
-        self.loop.run_until_complete(site.start())
-        logger.info(f"Network server running on {self.host}:{self.port}")
-        
-        self.loop.run_until_complete(self.start_periodic_sync())
         try:
+            self.loop.run_until_complete(self.start())
             self.loop.run_forever()
-        except KeyboardInterrupt:
-            logger.info("Network loop interrupted")
+        except Exception as e:
+            logger.error(f"Network error: {e}")
         finally:
-            self.loop.run_until_complete(self.stop())
             self.loop.close()
 
     async def stop(self):
@@ -235,7 +263,7 @@ class BlockchainNetwork:
 
     async def broadcast_block(self, block: Block) -> None:
         """Broadcast a block to all connected peers."""
-        async with self._lock:
+        with self.lock:
             tasks = []
             for peer_id, (host, port, _) in self.peers.items():
                 tasks.append(self.send_block(peer_id, host, port, block))
@@ -274,8 +302,8 @@ class BlockchainNetwork:
             return web.Response(status=400, text=str(e))
 
     async def broadcast_transaction(self, transaction: Transaction) -> None:
-        """Broadcast a transaction to all connected peers."""
-        async with self._lock:
+        """Thread-safe transaction broadcast"""
+        with self.lock:
             tasks = []
             for peer_id, (host, port, _) in self.peers.items():
                 tasks.append(self.send_transaction(peer_id, host, port, transaction))
@@ -384,7 +412,7 @@ class BlockchainNetwork:
             "signature": signature
         }
         tasks = []
-        async with self._lock:
+        with self.lock:
             for peer_id, (host, port, _) in self.peers.items():
                 url = f"https://{host}:{port}/announce_peer"
                 tasks.append(self.send_with_retry(url, data))
@@ -412,7 +440,7 @@ class BlockchainNetwork:
 
     async def discover_peers(self) -> None:
         """Discover new peers from bootstrap nodes and existing peers."""
-        async with self._lock:
+        with self.lock:
             # Bootstrap nodes
             for host, port in self.bootstrap_nodes:
                 if (host, port) != (self.host, self.port):
@@ -442,7 +470,7 @@ class BlockchainNetwork:
 
     async def add_peer(self, peer_id: str, host: str, port: int, public_key: str) -> bool:
         """Add a peer to the network."""
-        async with self._lock:
+        with self.lock:
             if len(self.peers) >= CONFIG["max_peers"] and peer_id not in self.peers:
                 return False
             peer_key = (host, port)
@@ -470,7 +498,7 @@ class BlockchainNetwork:
         """Request and potentially update the blockchain from peers."""
         best_chain = self.blockchain.chain
         best_difficulty = self.blockchain.get_total_difficulty()
-        async with self._lock:
+        with self.lock:
             tasks = []
             for peer_id, (host, port, _) in self.peers.items():
                 url = f"https://{host}:{port}/get_chain"
@@ -572,17 +600,164 @@ class BlockchainNetwork:
             
         # ... rest of transaction handling ...
 
-    async def handle_connection(self, ip: str):
-        if not await self.security_monitor.monitor_connection(ip):
-            logger.warning(f"Rejected connection from {ip}")
-            return False
-        return True
+    async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Thread-safe connection handling"""
+        with self.lock:
+            peer_address = writer.get_extra_info('peername')
+            client_ip = peer_address[0] if peer_address else 'unknown'
+            
+            try:
+                # Check security monitor if available
+                if self.security_monitor and not await self.security_monitor.monitor_connection(client_ip):
+                    logger.warning(f"Connection rejected from {client_ip} by security monitor")
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+                logger.info(f"New connection from {client_ip}")
+                
+                while not self.shutdown_flag:
+                    try:
+                        # Read message length first (4 bytes)
+                        length_data = await reader.read(4)
+                        if not length_data:
+                            break
+                        
+                        message_length = int.from_bytes(length_data, 'big')
+                        if message_length > 1048576:  # 1MB limit
+                            logger.warning(f"Message too large from {client_ip}")
+                            break
+                        
+                        # Read the actual message
+                        data = await reader.read(message_length)
+                        if not data:
+                            break
+                        
+                        try:
+                            # Try to decode as JSON
+                            message = json.loads(data.decode('utf-8'))
+                            await self.handle_message(message, client_ip)
+                        except json.JSONDecodeError:
+                            # If not JSON, try to handle as binary data
+                            await self.handle_binary_message(data, client_ip)
+                        
+                        # Send acknowledgment
+                        ack = "ACK".encode('utf-8')
+                        writer.write(len(ack).to_bytes(4, 'big') + ack)
+                        await writer.drain()
+                        
+                    except Exception as e:
+                        logger.error(f"Error handling connection from {client_ip}: {e}")
+                        if self.security_monitor:
+                            await self.security_monitor.record_failed_attempt(client_ip, 'connection_error')
+                        break
+                        
+            except Exception as e:
+                logger.error(f"Connection error from {client_ip}: {e}")
+                if self.security_monitor:
+                    await self.security_monitor.record_failed_attempt(client_ip, 'connection_error')
+                
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                    logger.info(f"Connection closed from {client_ip}")
+                except Exception as e:
+                    logger.error(f"Error closing connection from {client_ip}: {e}")
+
+    async def start_health_server(self):
+        """Start the health check HTTP server"""
+        try:
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            site = web.TCPSite(self.runner, self.host, self.port + 1)
+            await site.start()
+            logger.info(f"Starting health check server on {self.host}:{self.port + 1}")
+        except Exception as e:
+            logger.error(f"Failed to start health check server: {e}")
+            raise
+
+    async def start_server(self):
+        """Start both P2P and HTTP servers"""
+        try:
+            # Start P2P server
+            self.server = await asyncio.start_server(
+                self.handle_connection,
+                self.host,
+                self.port,
+                ssl=self.ssl_context
+            )
+            logger.info(f"Starting P2P server on {self.host}:{self.port}")
+
+            # Start health check server
+            await self.start_health_server()
+
+            async with self.server:
+                await self.server.serve_forever()
+
+        except Exception as e:
+            logger.error(f"Failed to start servers: {e}")
+            raise
+
+    async def handle_message(self, message: str, client_ip: str):
+        """Handle incoming messages"""
+        try:
+            # Add message handling logic here
+            # For example:
+            message_data = json.loads(message)
+            message_type = message_data.get('type')
+            
+            if message_type == 'transaction':
+                await self.handle_transaction(message_data['data'], client_ip)
+            elif message_type == 'block':
+                await self.handle_block(message_data['data'], client_ip)
+            else:
+                logger.warning(f"Unknown message type from {client_ip}: {message_type}")
+                
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON message from {client_ip}")
+            if self.security_monitor:
+                await self.security_monitor.record_failed_attempt(client_ip, 'invalid_message')
+        except Exception as e:
+            logger.error(f"Error processing message from {client_ip}: {e}")
+            if self.security_monitor:
+                await self.security_monitor.record_failed_attempt(client_ip, 'message_error')
+
+    async def cleanup(self):
+        """Cleanup network resources"""
+        logger.info("Cleaning up network resources...")
+        try:
+            if self.server:
+                self.server.close()
+                await self.server.wait_closed()
+            
+            if self.runner:
+                await self.runner.cleanup()
+            
+            # Close all peer connections
+            for peer in list(self.peers.values()):
+                try:
+                    await peer.close()
+                except Exception as e:
+                    logger.warning(f"Error closing peer connection: {e}")
+            
+            # Stop security monitor if active
+            if self.security_monitor:
+                await self.security_monitor.stop()
+            
+            logger.info("Network cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during network cleanup: {e}")
+
+    def run(self):
+        """Run the network in its own event loop"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         
-    async def handle_critical_operation(self, user_id: str, operation: str, mfa_token: Optional[str] = None):
-        """Handle operations that require MFA"""
-        if operation in ['key_rotation', 'validator_update', 'network_config']:
-            if not mfa_token or not await self.mfa_manager.verify_mfa(user_id, mfa_token):
-                logger.error(f"MFA verification failed for {operation} by {user_id}")
-                await self.security_monitor.record_failed_attempt(user_id, 'mfa_failure')
-                return False
-        return True
+        try:
+            self.loop.run_until_complete(self.start_server())
+        except Exception as e:
+            logger.error(f"Network error: {e}")
+        finally:
+            self.loop.run_until_complete(self.cleanup())
+            self.loop.close()

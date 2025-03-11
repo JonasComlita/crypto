@@ -12,6 +12,10 @@ from logging.handlers import RotatingFileHandler
 from prometheus_client import Counter, Gauge
 from utils import SecurityUtils, TransactionInput, TransactionOutput, TransactionType
 from collections import defaultdict
+from security import MFAManager
+import datetime
+import aiosqlite
+import threading
 
 handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
 logging.basicConfig(level=logging.INFO, handlers=[handler])
@@ -22,68 +26,52 @@ PEER_COUNT = Gauge('peer_count', 'Number of connected peers')
 
 class Transaction:
     """A transaction in the blockchain, representing a transfer of value."""
-    def __init__(self, tx_type: TransactionType, inputs: List[TransactionInput], 
-                 outputs: List[TransactionOutput], fee: float = 0.0, nonce: Optional[int] = None):
-        self.inputs = inputs
-        self.outputs = outputs
-        self.tx_type = tx_type
-        self.timestamp = time.time()
-        self.fee = fee
-        self.nonce = nonce or int(time.time() * 1000)
-        self.tx_id = self.calculate_tx_id()
+    def __init__(self, sender, recipient, amount):
+        self.sender = sender
+        self.recipient = recipient
+        self.amount = amount
+        self.timestamp = datetime.datetime.now().isoformat()
+        self.signature = None
         
+    def sign(self, private_key):
+        """Sign the transaction with the sender's private key - synchronous version"""
+        message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+        self.signature = private_key.sign(message)
+        return self.signature
+        
+    def verify(self, public_key):
+        """Verify the transaction signature - synchronous version"""
+        if not self.signature:
+            return False
+            
+        try:
+            message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+            public_key.verify(self.signature, message)
+            return True
+        except:
+            return False
 
-    def calculate_tx_id(self) -> str:
-        data = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True)
-        return hashlib.sha256(data.encode()).hexdigest()
-
-    def to_dict(self, exclude_signature: bool = False) -> Dict[str, Any]:
-        inputs = [i.to_dict() if not exclude_signature else {k: v for k, v in i.to_dict().items() if k != "signature"} 
-                  for i in self.inputs]
+    def to_dict(self) -> dict:
+        """Convert transaction to dictionary"""
         return {
-            "tx_type": self.tx_type.value,
-            "inputs": inputs,
-            "outputs": [o.to_dict() for o in self.outputs],
-            "fee": self.fee,
-            "nonce": self.nonce,
-            "tx_id": self.tx_id,
-            "timestamp": self.timestamp
+            'sender': self.sender,
+            'recipient': self.recipient,
+            'amount': self.amount,
+            'timestamp': self.timestamp,
+            'signature': self.signature
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Transaction':
-        tx_type = TransactionType(data["tx_type"])
-        inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
-        outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
-        tx = cls(tx_type=tx_type, inputs=inputs, outputs=outputs, fee=data["fee"], nonce=data.get("nonce"))
-        tx.tx_id = data["tx_id"]
-        tx.timestamp = data.get("timestamp", time.time())
+    def from_dict(cls, data: dict) -> 'Transaction':
+        """Create transaction from dictionary data"""
+        tx = cls(
+            sender=data['sender'],
+            recipient=data['recipient'],
+            amount=data['amount']
+        )
+        tx.timestamp = data.get('timestamp', tx.timestamp)
+        tx.signature = data.get('signature')
         return tx
-    
-    async def sign(self, private_key: str):
-        try:
-            sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
-            message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
-            for input_tx in self.inputs:
-                input_tx.signature = await asyncio.get_event_loop().run_in_executor(None, lambda: sk.sign(message))
-        except Exception as e:
-            logger.error(f"Failed to sign transaction {self.tx_id}: {e}")
-            raise
-
-    async def verify(self) -> bool:
-        try:
-            message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
-            tasks = []
-            for input_tx in self.inputs:
-                if not input_tx.signature or not input_tx.public_key:
-                    return False
-                vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(input_tx.public_key), curve=ecdsa.SECP256k1)
-                tasks.append(asyncio.get_event_loop().run_in_executor(None, lambda: vk.verify(input_tx.signature, message)))
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return all(isinstance(r, bool) and r for r in results)
-        except Exception as e:
-            logger.error(f"Transaction verification failed for {self.tx_id}: {e}")
-            return False
 
 class TransactionFactory:
     @staticmethod
@@ -154,35 +142,77 @@ async def calculate_merkle_root(transactions: List[Transaction]) -> str:
         raise
 
 class Block:
-    def __init__(self, index: int, transactions: List[Transaction], previous_hash: str, 
-                 difficulty: int, merkle_root: str):
+    def __init__(self, index: int, transactions: List, previous_hash: str):
+        """Initialize a new block"""
         self.index = index
+        self.timestamp = datetime.datetime.now().isoformat()
         self.transactions = transactions
-        self.merkle_root = merkle_root  # Pass pre-computed merkle_root
-        self.header = BlockHeader(index, previous_hash, time.time(), difficulty, self.merkle_root)
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.hash = self.calculate_hash()
 
-    @classmethod
-    async def create(cls, index: int, transactions: List[Transaction], previous_hash: str, 
-                     difficulty: int) -> 'Block':
-        merkle_root = await calculate_merkle_root(transactions)
-        return cls(index, transactions, previous_hash, difficulty, merkle_root)
-
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict:
+        """Convert block to dictionary for storage"""
         return {
-            "index": self.index,
-            "transactions": [t.to_dict() for t in self.transactions],
-            "header": self.header.to_dict()
+            'index': self.index,
+            'timestamp': self.timestamp,
+            'transactions': [tx.__dict__ for tx in self.transactions],
+            'previous_hash': self.previous_hash,
+            'nonce': self.nonce,
+            'hash': self.hash
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Block':
-        transactions = [Transaction.from_dict(t) for t in data["transactions"]]
-        header = BlockHeader.from_dict(data["header"])
-        block = cls(index=data["index"], transactions=transactions, 
-                   previous_hash=header.previous_hash, difficulty=header.difficulty, 
-                   merkle_root=header.merkle_root)
-        block.header = header
+    def from_dict(cls, data: dict) -> 'Block':
+        """Create block from dictionary data"""
+        # Create block with basic data
+        block = cls(
+            index=data['index'],
+            transactions=[],  # Empty list initially
+            previous_hash=data['previous_hash']
+        )
+        
+        # Restore other attributes
+        block.timestamp = data['timestamp']
+        block.nonce = data['nonce']
+        block.hash = data['hash']
+        
+        # Restore transactions
+        block.transactions = [
+            Transaction(
+                sender=tx['sender'],
+                recipient=tx['recipient'],
+                amount=tx['amount']
+            ) for tx in data['transactions']
+        ]
+        
+        # Set transaction timestamps if they exist in the data
+        for i, tx_data in enumerate(data['transactions']):
+            if 'timestamp' in tx_data:
+                block.transactions[i].timestamp = tx_data['timestamp']
+            if 'signature' in tx_data:
+                block.transactions[i].signature = tx_data['signature']
+                
         return block
+
+    def calculate_hash(self) -> str:
+        """Calculate block hash"""
+        block_string = (
+            f"{self.index}"
+            f"{self.timestamp}"
+            f"{json.dumps([tx.__dict__ for tx in self.transactions])}"
+            f"{self.previous_hash}"
+            f"{self.nonce}"
+        )
+        return hashlib.sha256(block_string.encode()).hexdigest()
+
+    def mine_block(self, difficulty: int) -> str:
+        """Mine the block with proof of work"""
+        target = "0" * difficulty
+        while not self.hash.startswith(target):
+            self.nonce += 1
+            self.hash = self.calculate_hash()
+        return self.hash
 
 class UTXOSet:
     def __init__(self):
@@ -331,8 +361,7 @@ class Miner:
             self.current_block = Block(
                 index=latest_block.index + 1,
                 transactions=transactions,
-                previous_hash=latest_block.header.hash,
-                difficulty=self.blockchain.adjust_difficulty()
+                previous_hash=latest_block.hash
             )
 
     async def stop_mining(self):
@@ -344,15 +373,15 @@ class Miner:
         async with self._lock:
             if not self.current_block or not self._running:
                 return False
-            target = "0" * self.current_block.header.difficulty
+            target = "0" * self.current_block.difficulty
             nonce = 0
             start_time = time.time()
-            logger.info(f"Starting to mine block {self.current_block.index} with difficulty {self.current_block.header.difficulty}")
+            logger.info(f"Starting to mine block {self.current_block.index} with difficulty {self.current_block.difficulty}")
             while self._running:
-                self.current_block.header.nonce = nonce
-                block_hash = self.current_block.header.calculate_hash()
+                self.current_block.nonce = nonce
+                block_hash = self.current_block.calculate_hash()
                 if block_hash.startswith(target):
-                    self.current_block.header.hash = block_hash
+                    self.current_block.hash = block_hash
                     logger.info(f"Block {self.current_block.index} mined with hash {block_hash}")
                     return True
                 nonce += 1
@@ -386,7 +415,7 @@ class NonceTracker:
             del self.nonce_expiry[(addr, nonce)]
 
 class Blockchain:
-    def __init__(self, storage_path: str = "chain.db"):
+    def __init__(self, mfa_manager=None, backup_manager=None, storage_path: str = "chain.db", node_id=None):
         self.chain: List[Block] = []
         self.storage_path = storage_path
         self.difficulty = 4
@@ -403,59 +432,150 @@ class Blockchain:
         self.checkpoint_interval = 100
         self.checkpoints = [0]
         self.nonce_tracker = NonceTracker()
-        # Do not call load_chain() here; defer to async init
+        self.mfa_manager = mfa_manager
+        self.backup_manager = backup_manager
+        self.node_id = node_id
+        self.wallets = {}  # Store wallet addresses and their keys
+        self.pending_transactions: List[Transaction] = []
+        self.mining_thread = None
+        self.mining_flag = threading.Event()
+        self.create_genesis_block()
 
-    async def initialize(self) -> None:
-        """Async initialization method to load the chain."""
-        await self.load_chain()
-        self.update_metrics()
-
-    async def load_chain(self) -> None:
-        async with self._lock:
-            try:
-                conn = sqlite3.connect(self.storage_path)
-                cursor = conn.cursor()
-                cursor.execute("CREATE TABLE IF NOT EXISTS blocks ([index] INTEGER PRIMARY KEY, data TEXT)")
-                cursor.execute("SELECT data FROM blocks ORDER BY [index]")
-                rows = cursor.fetchall()
-                if not rows:
-                    genesis_block = await self.create_genesis_block()
-                    self.chain.append(genesis_block)
-                    cursor.execute("INSERT INTO blocks ([index], data) VALUES (?, ?)", 
-                                 (0, json.dumps(genesis_block.to_dict())))
-                    conn.commit()
-                else:
-                    self.chain = [Block.from_dict(json.loads(row[0])) for row in rows]
-                    for block in self.chain:
-                        await self.utxo_set.update_with_block(block)
-                conn.close()
-            except Exception as e:
-                logger.error(f"Failed to load chain: {e}")
-                raise
-
-    async def create_genesis_block(self) -> Block:
+    async def initialize(self):
+        """Initialize the blockchain database and load chain"""
         try:
-            genesis_block = await Block.create(index=0, transactions=[], previous_hash="0" * 64, 
-                                             difficulty=self.difficulty)
-            genesis_block.header.hash = genesis_block.header.calculate_hash()
-            return genesis_block
+            async with aiosqlite.connect('blockchain.db') as db:
+                # Create tables if they don't exist
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS blocks (
+                        id INTEGER PRIMARY KEY,
+                        data TEXT NOT NULL
+                    )
+                ''')
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS wallets (
+                        address TEXT PRIMARY KEY,
+                        public_key TEXT NOT NULL,
+                        private_key TEXT NOT NULL
+                    )
+                ''')
+                await db.commit()
+                logger.info("Database initialized")
+            
+            # Load existing chain
+            await self.load_chain()
+            await self.load_wallets()
+            
         except Exception as e:
-            logger.error(f"Failed to create genesis block: {e}")
+            logger.error(f"Failed to initialize blockchain: {e}")
             raise
 
-    async def save_chain(self) -> None:
-        async with self._lock:
-            try:
-                conn = sqlite3.connect(self.storage_path)
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM blocks WHERE [index] >= ?", (len(self.chain) - 1,))
-                cursor.execute("INSERT OR REPLACE INTO blocks ([index], data) VALUES (?, ?)", 
-                            (self.chain[-1].index, json.dumps(self.chain[-1].to_dict())))
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                logger.error(f"Failed to save chain: {e}")
+    async def load_chain(self):
+        """Load blockchain from storage"""
+        try:
+            async with aiosqlite.connect('blockchain.db') as db:
+                async with db.execute('SELECT data FROM blocks ORDER BY id') as cursor:
+                    rows = await cursor.fetchall()
+                    if rows:
+                        self.chain = [Block.from_dict(json.loads(row[0])) for row in rows]
+                        logger.info(f"Loaded {len(self.chain)} blocks from storage")
+                    else:
+                        logger.info("No existing chain found in storage")
+                        # If no chain exists, create genesis block
+                        if not self.chain:
+                            self.create_genesis_block()
+                            await self.save_chain()
+        except Exception as e:
+            logger.error(f"Failed to load chain: {e}")
+            if "no such table" in str(e):
+                logger.info("Creating new blockchain")
+                self.create_genesis_block()
+                await self.save_chain()
+            else:
                 raise
+
+    def create_genesis_block(self):
+        """Create the genesis block synchronously"""
+        genesis_block = Block(
+            index=0,
+            transactions=[],
+            previous_hash="0"
+        )
+        self.chain.append(genesis_block)
+        return genesis_block
+
+    async def save_chain(self):
+        """Save blockchain to storage"""
+        try:
+            async with aiosqlite.connect('blockchain.db') as db:
+                # Create table if it doesn't exist
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS blocks (
+                        id INTEGER PRIMARY KEY,
+                        data TEXT NOT NULL
+                    )
+                ''')
+                
+                # Clear existing blocks
+                await db.execute('DELETE FROM blocks')
+                
+                # Save all blocks
+                for block in self.chain:
+                    await db.execute(
+                        'INSERT INTO blocks (data) VALUES (?)',
+                        (json.dumps(block.to_dict()),)
+                    )
+                await db.commit()
+                logger.info(f"Saved {len(self.chain)} blocks to storage")
+        except Exception as e:
+            logger.error(f"Failed to save chain: {e}")
+            raise
+
+    async def load_wallets(self):
+        """Load wallets from storage"""
+        try:
+            async with aiosqlite.connect('blockchain.db') as db:
+                async with db.execute('SELECT address, public_key, private_key FROM wallets') as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        address, public_key, private_key = row
+                        self.wallets[address] = {
+                            'public_key': public_key,
+                            'private_key': private_key
+                        }
+                    logger.info(f"Loaded {len(self.wallets)} wallets from storage")
+        except Exception as e:
+            logger.error(f"Failed to load wallets: {e}")
+            if "no such table" not in str(e):
+                raise
+
+    async def save_wallets(self):
+        """Save wallets to storage"""
+        try:
+            async with aiosqlite.connect('blockchain.db') as db:
+                # Create table if it doesn't exist
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS wallets (
+                        address TEXT PRIMARY KEY,
+                        public_key TEXT NOT NULL,
+                        private_key TEXT NOT NULL
+                    )
+                ''')
+                
+                # Clear existing wallets
+                await db.execute('DELETE FROM wallets')
+                
+                # Save all wallets
+                for address, wallet in self.wallets.items():
+                    await db.execute(
+                        'INSERT INTO wallets (address, public_key, private_key) VALUES (?, ?, ?)',
+                        (address, wallet['public_key'], wallet['private_key'])
+                    )
+                await db.commit()
+                logger.info(f"Saved {len(self.wallets)} wallets to storage")
+        except Exception as e:
+            logger.error(f"Failed to save wallets: {e}")
+            raise
 
     def update_metrics(self):
         self.block_height.set(len(self.chain) - 1)
@@ -467,15 +587,15 @@ class Blockchain:
             try:
                 if block.index > 0:
                     if block.index > len(self.chain):
-                        logger.info(f"Block {block.header.hash[:8]} index {block.index} exceeds chain length {len(self.chain)} - potential orphan")
+                        logger.info(f"Block {block.hash[:8]} index {block.index} exceeds chain length {len(self.chain)} - potential orphan")
                         return False
                     prev_block = self.chain[block.index - 1]
-                    if block.header.timestamp <= prev_block.header.timestamp:
+                    if block.timestamp <= prev_block.timestamp:
                         return False
-                    if block.header.previous_hash != prev_block.header.hash:
+                    if block.previous_hash != prev_block.hash:
                         return False
 
-                if block.header.timestamp > time.time() + 2 * 3600:
+                if block.timestamp > time.time() + 2 * 3600:
                     return False
 
                 if not block.transactions or block.transactions[0].tx_type != TransactionType.COINBASE:
@@ -498,12 +618,12 @@ class Blockchain:
                             if await self.utxo_set.is_nonce_used(address, tx.nonce):
                                 return False
 
-                target = "0" * block.header.difficulty
-                if not block.header.hash or not block.header.hash.startswith(target):
+                target = "0" * block.difficulty
+                if not block.hash or not block.hash.startswith(target):
                     return False
 
                 calculated_merkle_root = await calculate_merkle_root(block.transactions)
-                if block.header.merkle_root != calculated_merkle_root:
+                if block.merkle_root != calculated_merkle_root:
                     return False
 
                 tasks = [tx.verify() for tx in block.transactions]
@@ -519,9 +639,9 @@ class Blockchain:
     async def add_block(self, block: Block) -> bool:
         async with self._lock:
             try:
-                if any(b.header.hash == block.header.hash for b in self.chain):
+                if any(b.hash == block.hash for b in self.chain):
                     return False
-                if block.index == len(self.chain) and block.header.previous_hash == self.chain[-1].header.hash:
+                if block.index == len(self.chain) and block.previous_hash == self.chain[-1].hash:
                     if await self.validate_block(block):
                         self.chain.append(block)
                         await self.utxo_set.update_with_block(block)
@@ -536,7 +656,7 @@ class Blockchain:
                         self.update_metrics()
                         await self._process_orphans()
                         BLOCKS_MINED.inc()
-                        logger.info(f"Added block {block.index} to chain: {block.header.hash[:8]}")
+                        logger.info(f"Added block {block.index} to chain: {block.hash[:8]}")
                         return True
                 else:
                     await self.handle_potential_fork(block)
@@ -548,7 +668,7 @@ class Blockchain:
     async def _process_orphans(self):
         async with self._lock:
             for hash, orphan in list(self.orphans.items()):
-                if orphan.header.previous_hash == self.chain[-1].header.hash and orphan.index == len(self.chain):
+                if orphan.previous_hash == self.chain[-1].hash and orphan.index == len(self.chain):
                     if await self.validate_block(orphan):
                         self.chain.append(orphan)
                         await self.utxo_set.update_with_block(orphan)
@@ -562,7 +682,7 @@ class Blockchain:
     def adjust_difficulty(self) -> int:
         if len(self.chain) % 2016 == 0 and len(self.chain) > 1:
             period_blocks = self.chain[-2016:]
-            time_taken = period_blocks[-1].header.timestamp - period_blocks[0].header.timestamp
+            time_taken = period_blocks[-1].timestamp - period_blocks[0].timestamp
             target_time = 2016 * 60
             if time_taken > 0:
                 ratio = target_time / time_taken
@@ -576,24 +696,24 @@ class Blockchain:
         return self.difficulty
 
     def get_total_difficulty(self):
-        return sum(block.header.difficulty for block in self.chain)
+        return sum(block.difficulty for block in self.chain)
 
     async def is_valid_chain(self, chain):
-        if not chain or chain[0].header.hash != self.create_genesis_block().header.hash:
+        if not chain or chain[0].hash != self.create_genesis_block().hash:
             return False
         for i in range(1, len(chain)):
             if not await self._is_valid_block(chain[i], chain[i-1]):
                 return False
         for checkpoint in self.checkpoints:
-            if checkpoint >= len(chain) or chain[checkpoint].header.hash != self.chain[checkpoint].header.hash:
+            if checkpoint >= len(chain) or chain[checkpoint].hash != self.chain[checkpoint].hash:
                 return False
         return True
 
     async def _is_valid_block(self, block: Block, prev_block: Block) -> bool:
-        if block.index != prev_block.index + 1 or block.header.previous_hash != prev_block.header.hash:
+        if block.index != prev_block.index + 1 or block.previous_hash != prev_block.hash:
             return False
-        target = "0" * block.header.difficulty
-        return block.header.hash and block.header.hash.startswith(target)
+        target = "0" * block.difficulty
+        return block.hash and block.hash.startswith(target)
 
     def halve_block_reward(self) -> None:
         self.current_reward /= 2
@@ -604,9 +724,9 @@ class Blockchain:
                 return
             if block.index > len(self.chain):
                 if len(self.orphans) >= self.max_orphans:
-                    oldest = min(self.orphans.keys(), key=lambda k: self.orphans[k].header.timestamp)
+                    oldest = min(self.orphans.keys(), key=lambda k: self.orphans[k].timestamp)
                     del self.orphans[oldest]
-                self.orphans[block.header.hash] = block
+                self.orphans[block.hash] = block
             if self.network:
                 await self.network.request_chain()
 
@@ -700,8 +820,295 @@ class Blockchain:
             if change > 0:
                 outputs.append(TransactionOutput(recipient=sender_address, amount=change))
             tx = Transaction(tx_type=TransactionType.TRANSFER, inputs=inputs, outputs=outputs, fee=fee)
-            await tx.sign(sender_private_key)
+            await tx.sign(private_key)
             return tx
         except Exception as e:
             logger.error(f"Failed to create transaction: {e}")
             return None
+
+    async def add_validator(self, validator_id: str, mfa_token: str = None) -> bool:
+        """Add a new validator with MFA verification"""
+        if not await self.mfa_manager.verify_mfa(validator_id, mfa_token):
+            logger.warning(f"MFA verification failed for validator {validator_id}")
+            return False
+            
+        # ... existing validator addition logic ...
+        
+    async def update_network_config(self, config: dict, admin_id: str, mfa_token: str = None) -> bool:
+        """Update network configuration with MFA verification"""
+        if not await self.mfa_manager.verify_mfa(admin_id, mfa_token):
+            logger.warning(f"MFA verification failed for admin {admin_id}")
+            return False
+            
+        # ... existing configuration update logic ...
+
+    def get_all_addresses(self):
+        """Return list of all wallet addresses in the blockchain"""
+        # Collect unique addresses from all transactions
+        addresses = set()
+        
+        # Add addresses from chain
+        for block in self.chain:
+            for tx in block.transactions:
+                addresses.add(tx.sender)
+                addresses.add(tx.recipient)
+                
+        # Add addresses from pending transactions
+        for tx in self.pending_transactions:
+            addresses.add(tx.sender)
+            addresses.add(tx.recipient)
+            
+        # Remove None or empty addresses
+        addresses.discard(None)
+        addresses.discard("")
+        
+        # Convert to sorted list for consistent display
+        return sorted(list(addresses))
+
+    def get_balance(self, address):
+        """Calculate balance for a given address"""
+        balance = 0.0
+        
+        # Check all confirmed transactions in the chain
+        for block in self.chain:
+            for tx in block.transactions:
+                if tx.sender == address:
+                    balance -= tx.amount
+                if tx.recipient == address:
+                    balance += tx.amount
+                    
+        # Check pending transactions
+        for tx in self.pending_transactions:
+            if tx.sender == address:
+                balance -= tx.amount
+            if tx.recipient == address:
+                balance += tx.amount
+                
+        return balance
+
+    def get_transactions_for_address(self, address):
+        """Get all transactions involving a specific address"""
+        transactions = []
+        
+        # Get transactions from chain
+        for block in self.chain:
+            for tx in block.transactions:
+                if tx.sender == address or tx.recipient == address:
+                    transactions.append(tx)
+                    
+        # Get pending transactions
+        for tx in self.pending_transactions:
+            if tx.sender == address or tx.recipient == address:
+                transactions.append(tx)
+                
+        # Sort by timestamp, newest first
+        transactions.sort(key=lambda x: x.timestamp, reverse=True)
+        return transactions
+
+    def create_wallet(self):
+        """Create a new wallet with public/private key pair"""
+        private_key = ecdsa.SigningKey.generate()
+        public_key = private_key.get_verifying_key()
+        
+        # Create address from public key
+        address = public_key.to_string().hex()
+        
+        # Store wallet
+        self.wallets[address] = {
+            'private_key': private_key,
+            'public_key': public_key
+        }
+        
+        return address
+
+    def get_wallet(self, address):
+        """Get wallet information for an address"""
+        return self.wallets.get(address)
+
+    def create_transaction(self, sender, recipient, amount):
+        """Create a new transaction"""
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+            
+        # Check sender's balance
+        if self.get_balance(sender) < amount:
+            raise ValueError("Insufficient balance")
+            
+        # Create and sign transaction
+        tx = Transaction(sender, recipient, amount)
+        
+        # Get sender's wallet
+        wallet = self.get_wallet(sender)
+        if wallet:
+            # Synchronous signing
+            tx.sign(wallet['private_key'])
+        else:
+            raise ValueError("Sender wallet not found")
+        
+        # Add to pending transactions
+        self.pending_transactions.append(tx)
+        return tx
+
+    def create_block(self) -> Block:
+        """Create a new block with pending transactions"""
+        if not self.chain:
+            return self.create_genesis_block()
+
+        last_block = self.chain[-1]
+        new_block = Block(
+            index=len(self.chain),
+            transactions=self.pending_transactions,
+            previous_hash=last_block.hash
+        )
+        
+        # Add to chain and clear pending transactions
+        self.chain.append(new_block)
+        self.pending_transactions = []
+        
+        return new_block
+
+    def get_latest_block(self) -> Optional[Block]:
+        """Get the latest block in the chain"""
+        return self.chain[-1] if self.chain else None
+
+    def start_mining(self):
+        """Start the mining process in a separate thread"""
+        if self.mining_thread and self.mining_thread.is_alive():
+            logger.warning("Mining already in progress")
+            return False
+            
+        self.mining_flag.set()
+        self.mining_thread = threading.Thread(target=self._mine_pending_transactions)
+        self.mining_thread.daemon = True
+        self.mining_thread.start()
+        logger.info("Mining process started")
+        return True
+
+    def stop_mining(self):
+        """Stop the mining process"""
+        self.mining_flag.clear()
+        if self.mining_thread:
+            self.mining_thread.join(timeout=1)
+            self.mining_thread = None
+        logger.info("Mining process stopped")
+
+    def _mine_pending_transactions(self):
+        """Mining loop that runs in a separate thread"""
+        while self.mining_flag.is_set():
+            if not self.pending_transactions:
+                time.sleep(1)  # Wait for transactions
+                continue
+                
+            try:
+                # Create new block with pending transactions
+                new_block = Block(
+                    index=len(self.chain),
+                    transactions=self.pending_transactions.copy(),
+                    previous_hash=self.chain[-1].hash
+                )
+                
+                # Mine the block
+                success = new_block.mine_block(self.difficulty)
+                if success and self.mining_flag.is_set():
+                    with self._lock:
+                        self.chain.append(new_block)
+                        self.pending_transactions = []
+                        logger.info(f"Mined new block #{new_block.index} with hash {new_block.hash}")
+                        
+                    # Broadcast new block to network
+                    if hasattr(self, 'network'):
+                        asyncio.run_coroutine_threadsafe(
+                            self.network.broadcast_block(new_block),
+                            self.network.loop
+                        )
+                        
+            except Exception as e:
+                logger.error(f"Mining error: {e}")
+                time.sleep(1)
+
+    def validate_block(self, block: Block) -> bool:
+        """Validate a block's hash and transactions"""
+        # Check block hash
+        if not block.hash.startswith('0' * self.difficulty):
+            return False
+            
+        # Verify block hash matches its contents
+        if block.calculate_hash() != block.hash:
+            return False
+            
+        # Verify transactions
+        for tx in block.transactions:
+            if not self.validate_transaction(tx):
+                return False
+                
+        return True
+
+    def validate_transaction(self, transaction: Transaction) -> bool:
+        """Validate a transaction's signature and sender's balance"""
+        try:
+            # Skip validation for mining rewards
+            if transaction.sender is None:
+                return True
+                
+            # Verify signature
+            if not transaction.verify():
+                return False
+                
+            # Check sender has sufficient balance
+            sender_balance = self.get_balance(transaction.sender)
+            if sender_balance < transaction.amount:
+                return False
+                
+            return True
+        except Exception as e:
+            logger.error(f"Transaction validation error: {e}")
+            return False
+
+    def add_block(self, block: Block) -> bool:
+        """Add a new block to the chain after validation"""
+        try:
+            # Validate block
+            if not self.validate_block(block):
+                return False
+                
+            # Check block links to previous block
+            if block.previous_hash != self.chain[-1].hash:
+                return False
+                
+            # Add block to chain
+            with self._lock:
+                self.chain.append(block)
+                # Remove transactions that are now in the block
+                self.pending_transactions = [
+                    tx for tx in self.pending_transactions 
+                    if tx not in block.transactions
+                ]
+                
+            logger.info(f"Added block #{block.index} to chain")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding block: {e}")
+            return False
+
+    def get_hashrate(self) -> float:
+        """Calculate current mining hashrate"""
+        # Simple hashrate calculation based on recent blocks
+        try:
+            if len(self.chain) < 2:
+                return 0
+                
+            recent_blocks = self.chain[-10:]  # Look at last 10 blocks
+            time_diff = (
+                datetime.datetime.fromisoformat(recent_blocks[-1].timestamp) -
+                datetime.datetime.fromisoformat(recent_blocks[0].timestamp)
+            ).total_seconds()
+            
+            if time_diff <= 0:
+                return 0
+                
+            return len(recent_blocks) / time_diff * self.difficulty
+            
+        except Exception as e:
+            logger.error(f"Error calculating hashrate: {e}")
+            return 0
