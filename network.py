@@ -8,7 +8,7 @@ import os
 import logging
 import time
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import defaultdict
 from blockchain import Blockchain, Block, Transaction
 from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth
@@ -18,6 +18,8 @@ from security import SecurityMonitor
 from security.mfa import MFAManager
 import json
 import threading
+from dataclasses import dataclass
+from blockchain import Blockchain, Block, Transaction
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
@@ -138,7 +140,10 @@ class BlockchainNetwork:
         self.peer_failures: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
         self.lock = threading.Lock()  # Add thread lock
-        self.active_requests = Gauge('active_peer_requests', 'Number of active requests to peers')
+        self.active_requests = Gauge(
+            f'active_peer_requests_{node_id}',
+            'Number of active requests to peers'
+            )
         self.peer_reputation = PeerReputation()
         self.rate_limiter = RateLimiter()
         self.nonce_tracker = NonceTracker()
@@ -209,19 +214,10 @@ class BlockchainNetwork:
         
         # ... rest of start-up code ...
 
-    def run(self) -> None:
-        """Start the network server and background tasks in its own event loop."""
+    def run(self):
         logger.info(f"Starting network server on {self.host}:{self.port}")
-        self.loop = asyncio.new_event_loop()  # Create a new loop for this thread
         asyncio.set_event_loop(self.loop)
-        
-        try:
-            self.loop.run_until_complete(self.start())
-            self.loop.run_forever()
-        except Exception as e:
-            logger.error(f"Network error: {e}")
-        finally:
-            self.loop.close()
+        self.loop.run_until_complete(self.start_server())
 
     async def stop(self):
         """Stop the network and cancel background tasks."""
@@ -345,6 +341,33 @@ class BlockchainNetwork:
             return web.Response(status=403, text="Invalid authentication")
         chain_data = [block.to_dict() for block in self.blockchain.chain]
         return web.json_response(chain_data)
+
+    async def send_chain(self, peer_id: str, chain_data: List[dict]) -> None:
+        """Send blockchain data to a specific peer.
+        
+        Args:
+            peer_id: The ID of the peer to send the chain to
+            chain_data: List of serialized blocks to send
+        """
+        try:
+            if peer_id not in self.peers:
+                logger.warning(f"Cannot send chain to unknown peer {peer_id}")
+                return
+
+            host, port, _ = self.peers[peer_id]
+            url = f"https://{host}:{port}/receive_chain"
+            data = {"chain": chain_data}
+            
+            success, _ = await self.send_with_retry(url, data)
+            if success:
+                logger.info(f"Successfully sent chain data to peer {peer_id}")
+            else:
+                logger.warning(f"Failed to send chain data to peer {peer_id}")
+                self._increment_failure(peer_id)
+                
+        except Exception as e:
+            logger.error(f"Error sending chain to peer {peer_id}: {e}")
+            self._increment_failure(peer_id)
 
     def _load_peers(self) -> Dict[str, Tuple[str, int, str]]:
         """Load known peers from persistent storage."""

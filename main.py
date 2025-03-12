@@ -5,7 +5,7 @@ import logging
 import signal
 import sys
 import os
-from blockchain import Blockchain, Transaction
+from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
 from utils import find_available_port, init_rotation_manager
 from gui import BlockchainGUI
@@ -184,9 +184,12 @@ async def initialize_security(node_id: str) -> tuple:
     return security_monitor, mfa_manager, backup_manager
 
 def run_async_loop(loop):
-    """Run the async event loop in a separate thread"""
     asyncio.set_event_loop(loop)
-    loop.run_forever()
+    try:
+        loop.run_forever()
+    except Exception as e:
+        logger.error(f"Async loop crashed: {e}")
+
 
 def main():
     # Add resource limits before any other initialization
@@ -215,10 +218,12 @@ def main():
 
     # Initialize security components FIRST
     loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    security_monitor, mfa_manager, backup_manager = loop.run_until_complete(
-        initialize_security(node_id)
-    )
+    async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
+    async_thread.start()
+
+    security_monitor, mfa_manager, backup_manager = asyncio.run_coroutine_threadsafe(
+        initialize_security(f"node{port}"), loop
+    ).result()
 
     # Initialize key rotation (synchronous part)
     init_rotation_manager(node_id)
@@ -241,16 +246,26 @@ def main():
     rotation_thread.start()
 
     # Initialize blockchain with security components
-    blockchain = Blockchain(f"node{args.port}")
-    
-    # Create default wallet if none exists
+    blockchain = Blockchain(f"node{port}")
     if not blockchain.get_all_addresses():
         default_address = blockchain.create_wallet()
         logger.info(f"Created default wallet with address: {default_address}")
         
         # Add some initial coins to the default wallet (for testing)
-        genesis_tx = Transaction(None, default_address, 100.0)
+        genesis_tx = Transaction(
+            sender="0",
+            recipient=default_address,
+            amount=100.0,
+            tx_type=TransactionType.COINBASE
+        )
+        genesis_block = Block(
+            index=0,
+            transactions=[genesis_tx],
+            previous_hash="0"
+        )
         blockchain.pending_transactions.append(genesis_tx)
+        blockchain.chain = [genesis_block]  # Replace default genesis with this one
+        asyncio.run(blockchain.save_chain())  # Save immediately
         
         # Create a new block with the initial transaction
         try:
@@ -269,17 +284,10 @@ def main():
 
     # Update network initialization with security monitor
     network = BlockchainNetwork(
-        blockchain,
-        node_id,
-        "127.0.0.1",
-        port,
-        bootstrap_nodes,
+        blockchain, node_id, "127.0.0.1", port, bootstrap_nodes,
         security_monitor=security_monitor
     )
-    logger.info(f"Node {node_id} public key: {network.public_key}")
-
-    network_thread = threading.Thread(target=network.run, daemon=True)
-    network_thread.start()
+    network.loop = loop  # Assign shared loop
 
     # Create GUI with security components
     gui = BlockchainGUI(
@@ -290,30 +298,20 @@ def main():
     )
     
     # Create new event loop for async operations
-    loop = asyncio.new_event_loop()
+    gui.loop = loop
+
     
-    # Initialize blockchain in the async loop
-    loop.run_until_complete(blockchain.initialize())
-    
-    # Create and start async thread
-    async_thread = threading.Thread(
-        target=run_async_loop,
-        args=(loop,),
-        daemon=True
+    # Schedule network and key manager startup in the async loop
+    asyncio.run_coroutine_threadsafe(
+        network.start_server(),
+        loop
     )
-    async_thread.start()
+    asyncio.run_coroutine_threadsafe(
+        rotation_manager.start(),
+        loop
+    )
 
     try:
-        # Schedule network and key manager startup in the async loop
-        asyncio.run_coroutine_threadsafe(
-            network.start_server(),
-            loop
-        )
-        asyncio.run_coroutine_threadsafe(
-            rotation_manager.start(),
-            loop
-        )
-
         # Create and run GUI in main thread
         gui.run()  # This blocks until GUI is closed
 

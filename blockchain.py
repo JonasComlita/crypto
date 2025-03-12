@@ -3,7 +3,7 @@ import time
 import hashlib
 import asyncio
 import sqlite3
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -16,6 +16,11 @@ from security import MFAManager
 import datetime
 import aiosqlite
 import threading
+import concurrent.futures
+import psutil
+import tkinter as tk
+from tkinter import ttk
+import multiprocessing
 
 handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
 logging.basicConfig(level=logging.INFO, handlers=[handler])
@@ -25,62 +30,218 @@ BLOCKS_MINED = Counter('blocks_mined_total', 'Total number of blocks mined')
 PEER_COUNT = Gauge('peer_count', 'Number of connected peers')
 
 class Transaction:
-    """A transaction in the blockchain, representing a transfer of value."""
-    def __init__(self, sender, recipient, amount):
-        self.sender = sender
-        self.recipient = recipient
-        self.amount = amount
-        self.timestamp = datetime.datetime.now().isoformat()
-        self.signature = None
+    def __init__(self, 
+                 sender=None, 
+                 recipient=None, 
+                 amount=None, 
+                 tx_type: TransactionType = TransactionType.TRANSFER, 
+                 inputs: List[TransactionInput] = None, 
+                 outputs: List[TransactionOutput] = None, 
+                 fee: float = 0.0, 
+                 nonce: Optional[int] = None):
+        # Set defaults for all cases
+        self.nonce = nonce  # Explicitly set nonce, even if None
         
-    def sign(self, private_key):
-        """Sign the transaction with the sender's private key - synchronous version"""
-        message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
-        self.signature = private_key.sign(message)
-        return self.signature
+        # Coinbase transaction
+        if sender == "0" and recipient is not None and amount is not None:
+            self.sender = "0"
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = datetime.datetime.now().isoformat()
+            self.signature = None
+            self.tx_type = TransactionType.COINBASE
+            self.fee = 0.0
+            self.inputs = []
+            self.outputs = []
+        # Simple transfer
+        elif sender is not None and recipient is not None and amount is not None:
+            self.sender = sender
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = datetime.datetime.now().isoformat()
+            self.signature = None
+            self.tx_type = tx_type or TransactionType.TRANSFER
+            self.fee = fee
+            self.inputs = []
+            self.outputs = []
+        # UTXO-based
+        else:
+            self.inputs = inputs or []
+            self.outputs = outputs or []
+            self.tx_type = tx_type
+            self.timestamp = time.time()
+            self.fee = fee
+            self.nonce = nonce or int(time.time() * 1000)
+            self.sender = self.inputs[0].public_key if self.inputs else None
+            self.recipient = self.outputs[0].recipient if self.outputs else None
+            self.amount = self.outputs[0].amount if self.outputs else 0
         
-    def verify(self, public_key):
-        """Verify the transaction signature - synchronous version"""
-        if not self.signature:
-            return False
-            
-        try:
-            message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
-            public_key.verify(self.signature, message)
-            return True
-        except:
-            return False
+        # Calculate tx_id after all attributes are set
+        self.tx_id = None
+        self.tx_id = self.calculate_tx_id()
 
-    def to_dict(self) -> dict:
+    def calculate_tx_id(self) -> str:
+        """Calculate transaction ID based on transaction details"""
+        try:
+            if self.inputs or self.tx_type == TransactionType.COINBASE:
+                # UTXO-based or coinbase transaction
+                data = {
+                    "tx_type": self.tx_type.value,
+                    "inputs": [i.to_dict() for i in self.inputs],
+                    "outputs": [o.to_dict() for o in self.outputs],
+                    "fee": self.fee,
+                    "timestamp": self.timestamp
+                }
+                # Include nonce only if it exists
+                if hasattr(self, 'nonce') and self.nonce is not None:
+                    data["nonce"] = self.nonce
+                return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+            else:
+                # Simple transfer transaction
+                return hashlib.sha256(
+                    f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                ).hexdigest()
+        except Exception as e:
+            logger.error(f"Failed to calculate transaction ID: {e}")
+            raise
+
+    def to_dict(self, exclude_signature: bool = False) -> Dict[str, Any]:
         """Convert transaction to dictionary"""
-        return {
-            'sender': self.sender,
-            'recipient': self.recipient,
-            'amount': self.amount,
-            'timestamp': self.timestamp,
-            'signature': self.signature
-        }
+        try:
+            base_dict = {
+                "sender": self.sender,
+                "recipient": self.recipient,
+                "amount": self.amount,
+                "timestamp": self.timestamp,
+                "signature": self.signature if not exclude_signature else None,
+                "tx_type": self.tx_type.value,
+                "tx_id": self.tx_id
+            }
+            if hasattr(self, 'nonce') and self.nonce is not None:
+                base_dict["nonce"] = self.nonce
+            return base_dict
+        except Exception as e:
+            logger.error(f"Failed to convert transaction to dict: {e}")
+            raise
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'Transaction':
+    def from_dict(cls, data: Dict[str, Any]) -> 'Transaction':
         """Create transaction from dictionary data"""
-        tx = cls(
-            sender=data['sender'],
-            recipient=data['recipient'],
-            amount=data['amount']
-        )
-        tx.timestamp = data.get('timestamp', tx.timestamp)
-        tx.signature = data.get('signature')
-        return tx
+        try:
+            if "inputs" in data and "outputs" in data:
+                # UTXO-based transaction
+                tx_type = TransactionType(data["tx_type"])
+                inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
+                outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
+                tx = cls(
+                    tx_type=tx_type, 
+                    inputs=inputs, 
+                    outputs=outputs, 
+                    fee=data.get("fee", 0.0), 
+                    nonce=data.get("nonce")
+                )
+                tx.tx_id = data.get("tx_id")
+                tx.timestamp = data.get("timestamp", time.time())
+                return tx
+            else:
+                # Simple transfer transaction
+                tx = cls(
+                    sender=data['sender'], 
+                    recipient=data['recipient'], 
+                    amount=data['amount']
+                )
+                tx.timestamp = data.get('timestamp')
+                tx.signature = data.get('signature')
+                return tx
+        except Exception as e:
+            logger.error(f"Failed to create transaction from dict: {e}")
+            raise
+
+    def sign(self, private_key):
+        """Sign the transaction with the sender's private key - synchronous version"""
+        try:
+            if hasattr(self, 'inputs'):
+                # UTXO-based transaction signing
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
+                for input_tx in self.inputs:
+                    input_tx.signature = sk.sign(message)
+            else:
+                # Simple transfer transaction signing
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                self.signature = sk.sign(message)
+            return self.signature
+        except Exception as e:
+            logger.error(f"Failed to sign transaction: {e}")
+            raise
+
+    async def sign_async(self, private_key: str):
+        """Async version of sign method"""
+        try:
+            if hasattr(self, 'inputs'):
+                # UTXO-based transaction signing
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
+                for input_tx in self.inputs:
+                    input_tx.signature = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: sk.sign(message)
+                    )
+            else:
+                # Simple transfer transaction signing
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                self.signature = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: sk.sign(message)
+                )
+            return self.signature
+        except Exception as e:
+            logger.error(f"Failed to sign transaction asynchronously: {e}")
+            raise
+
+    async def verify(self) -> bool:
+        """Verify transaction signature"""
+        try:
+            if hasattr(self, 'inputs'):
+                # UTXO-based transaction verification
+                message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
+                tasks = []
+                for input_tx in self.inputs:
+                    if not input_tx.signature or not input_tx.public_key:
+                        return False
+                    vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(input_tx.public_key), curve=ecdsa.SECP256k1)
+                    tasks.append(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: vk.verify(input_tx.signature, message)
+                        )
+                    )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                return all(isinstance(r, bool) and r for r in results)
+            else:
+                # Simple transfer transaction verification
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                vk = ecdsa.VerifyingKey.from_string(
+                    bytes.fromhex(self.sender), 
+                    curve=ecdsa.SECP256k1
+                )
+                return vk.verify(self.signature, message)
+        except Exception as e:
+            logger.error(f"Transaction verification failed: {e}")
+            return False
 
 class TransactionFactory:
     @staticmethod
-    async def create_coinbase_transaction(recipient: str, amount: float, block_height: int) -> Transaction:
+    async def create_coinbase_transaction(self, recipient: str, amount: float, block_height: int) -> Transaction:
         try:
-            tx_id = hashlib.sha256(f"coinbase_{block_height}_{recipient}".encode()).hexdigest()
-            inputs = [TransactionInput(tx_id=tx_id, output_index=-1)]
-            outputs = [TransactionOutput(recipient=recipient, amount=amount)]
-            return Transaction(tx_type=TransactionType.COINBASE, inputs=inputs, outputs=outputs)
+            # Create a simple coinbase transaction without unnecessary UTXO complexity
+            tx = Transaction(
+                sender="0",
+                recipient=recipient,
+                amount=amount,
+                tx_type=TransactionType.COINBASE
+            )
+            logger.info(f"Created coinbase transaction for block {block_height} to {recipient}")
+            return tx
         except Exception as e:
             logger.error(f"Failed to create coinbase transaction: {e}")
             raise
@@ -141,6 +302,12 @@ async def calculate_merkle_root(transactions: List[Transaction]) -> str:
         logger.error(f"Failed to calculate Merkle root: {e}")
         raise
 
+class TransactionEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, TransactionType):
+            return obj.value
+        return super().default(obj)
+
 class Block:
     def __init__(self, index: int, transactions: List, previous_hash: str):
         """Initialize a new block"""
@@ -149,6 +316,8 @@ class Block:
         self.transactions = transactions
         self.previous_hash = previous_hash
         self.nonce = 0
+        self.difficulty = transactions[0].blockchain.difficulty if transactions and hasattr(transactions[0], 'blockchain') else 4
+        self.merkle_root = "0" * 64  # Default merkle root
         self.hash = self.calculate_hash()
 
     def to_dict(self) -> dict:
@@ -156,10 +325,12 @@ class Block:
         return {
             'index': self.index,
             'timestamp': self.timestamp,
-            'transactions': [tx.__dict__ for tx in self.transactions],
+            'transactions': [tx.to_dict() for tx in self.transactions],  # Use to_dict() instead of __dict__
             'previous_hash': self.previous_hash,
             'nonce': self.nonce,
-            'hash': self.hash
+            'difficulty': self.difficulty,
+            'merkle_root': self.merkle_root,
+            'hash': self.hash,
         }
 
     @classmethod
@@ -174,20 +345,21 @@ class Block:
         
         # Restore other attributes
         block.timestamp = data['timestamp']
-        block.nonce = data['nonce']
+        block.nonce = data.get('nonce', 0)
         block.hash = data['hash']
+        block.difficulty = data.get('difficulty', 4)
         
         # Restore transactions
         block.transactions = [
             Transaction(
-                sender=tx['sender'],
-                recipient=tx['recipient'],
-                amount=tx['amount']
-            ) for tx in data['transactions']
+                sender=tx.get('sender'),
+                recipient=tx.get('recipient'),
+                amount=tx.get('amount')
+            ) for tx in data.get('transactions', [])
         ]
         
         # Set transaction timestamps if they exist in the data
-        for i, tx_data in enumerate(data['transactions']):
+        for i, tx_data in enumerate(data.get('transactions', [])):
             if 'timestamp' in tx_data:
                 block.transactions[i].timestamp = tx_data['timestamp']
             if 'signature' in tx_data:
@@ -196,19 +368,18 @@ class Block:
         return block
 
     def calculate_hash(self) -> str:
-        """Calculate block hash"""
         block_string = (
             f"{self.index}"
             f"{self.timestamp}"
-            f"{json.dumps([tx.__dict__ for tx in self.transactions])}"
+            f"{json.dumps([tx.to_dict() for tx in self.transactions], cls=TransactionEncoder)}"
             f"{self.previous_hash}"
             f"{self.nonce}"
         )
         return hashlib.sha256(block_string.encode()).hexdigest()
 
-    def mine_block(self, difficulty: int) -> str:
-        """Mine the block with proof of work"""
-        target = "0" * difficulty
+    def _mine_block(self, block):
+        self._logger.debug(f"Starting to mine block {block.index}")
+        target = "0" * self.difficulty
         while not self.hash.startswith(target):
             self.nonce += 1
             self.hash = self.calculate_hash()
@@ -311,86 +482,209 @@ class Mempool:
                 self.transactions.pop(tx_id, None)
                 self.timestamps.pop(tx_id, None)
 
-class Miner:
-    def __init__(self, blockchain: 'Blockchain', mempool: Mempool, wallet_address: Optional[str] = None):
+class MiningService:
+    def __init__(self, blockchain):
         self.blockchain = blockchain
-        self.mempool = mempool
+        self.process_pool = concurrent.futures.ProcessPoolExecutor()
+        self.mining_tasks = {}
+
+    async def start_mining(self, wallet_address):
+        self._logger.info("Starting mining loop")
+        self.mining = True
+        return True
+
+    async def stop_mining(self):
+        self._logger.info("Stopping mining loop")
+        self.mining = False  # Assuming _mining_loop checks this
+        return True
+
+import threading
+import time
+import logging
+import queue
+
+class AsyncMiner:
+    """A robust asynchronous mining implementation"""
+    def __init__(self, blockchain, wallet_address=None, loop=None):
+        """
+        Initialize the miner
+        
+        :param blockchain: The blockchain instance
+        :param wallet_address: Address to receive mining rewards
+        """
+        self.blockchain = blockchain
         self.wallet_address = wallet_address
-        self.current_block: Optional[Block] = None
-        self._running = False
-        self._lock = asyncio.Lock()
+        
+        # Mining control
+        self.mining = False
+        self._mining_thread = None
+        self._stop_event = threading.Event()
+        
+        # Logging
+        self._logger = logging.getLogger(__name__)
+        
+        # Performance tracking
+        self.blocks_mined = 0
+        self.total_hashes = 0
+        self.start_time = 0
 
-    async def start_mining(self):
-        async with self._lock:
-            if not self.wallet_address:
-                raise ValueError("No wallet address set for mining")
-            if self._running:
-                logger.warning("Mining is already running")
-                return
-            self._running = True
-            logger.info("Mining started")
-            asyncio.create_task(self._mine_continuously())
+        self.loop = loop
+        self._process_pool = concurrent.futures.ProcessPoolExecutor()
 
-    async def _mine_continuously(self) -> None:
-        while self._running:
-            try:
-                await self._create_new_block()
-                if await self._mine_current_block():
-                    success = await self.blockchain.add_block(self.current_block)
-                    if success:
-                        tx_ids = [tx.tx_id for tx in self.current_block.transactions]
-                        await self.mempool.remove_transactions(tx_ids)
-                        logger.info(f"Successfully mined block {self.current_block.index}")
-                        if hasattr(self.blockchain, 'network'):
-                            await self.blockchain.network.broadcast_block(self.current_block)
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Mining error: {e}")
-                await asyncio.sleep(1)
+    def start_mining(self):
+        if not self.wallet_address:
+            self._logger.error("No wallet address set for mining")
+            return False
 
-    async def _create_new_block(self) -> None:
-        async with self._lock:
+        if self.mining:
+            self._logger.warning("Mining is already running")
+            return False
+
+        self.mining = True
+        self.start_time = time.time()
+        self._stop_event.clear()
+        try:
+            asyncio.create_task(self._mining_loop())
+            self._logger.info(f"Mining thread started for {self.wallet_address}")
+            return True
+        except Exception as e:
+            self._logger.error(f"failed to start mining loop: {e}")
+            self.mining = False
+            return False
+
+    async def stop_mining(self):
+        """Stop the mining process cleanly"""
+        self._logger.info("Stopping mining...")
+        try:
+            self.mining = False
+            self._stop_event.set()
+            
+            # Wait briefly for mining loop to exit
+            await asyncio.sleep(0.5)  # Give time for loop to check stop condition
+            
+            # Shut down the process pool
+            if self._process_pool:
+                self._process_pool.shutdown(wait=True)
+                self._logger.info("Mining process pool shut down")
+                self._process_pool = None  # Clear reference
+            
+            self.start_time = 0  # Reset hashrate tracking
+            self.total_hashes = 0
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to stop mining: {e}")
+            return False
+        finally:
+            self.mining = False
+            self._logger.info("Mining stopped")
+
+    async def _mining_loop(self):
+        self._logger.info("Entering mining loop")
+        try:
+            while self.mining and not self._stop_event.is_set():
+                self._logger.debug("Mining loop iteration")
+                try:
+                    block = self._create_block()
+                    if block:
+                        self._logger.info(f"Created block {block.index}")
+                        mined_block = await asyncio.get_event_loop().run_in_executor(
+                            self._process_pool, self._mine_block, block
+                        )
+                        if mined_block:
+                            if await self._add_block_to_chain(mined_block):
+                                self._logger.debug(f"Block {block.index} processed successfully")
+                            else:
+                                self._logger.warning(f"Block {block.index} not added, continuing")
+                        else:
+                            self._logger.warning("Failed to mine block")
+                    else:
+                        self._logger.warning("Failed to create block")
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    self._logger.error(f"Mining iteration error: {e}")
+                    await asyncio.sleep(1)
+        except Exception as e:
+            self._logger.error(f"Mining loop crashed: {e}")
+        finally:
+            self.mining = False
+            self._logger.info("Mining loop exited")
+
+    def _create_block(self):
+        """Synchronous block creation"""
+        try:
             latest_block = self.blockchain.chain[-1]
-            transactions = await self.mempool.get_transactions(1000, 1000000)
-            coinbase_tx = await TransactionFactory.create_coinbase_transaction(
+            transactions = list(self.blockchain.mempool.transactions.values())[:1000]
+            # Synchronous coinbase creation for simplicity
+            coinbase_tx = Transaction(
+                sender="0",
                 recipient=self.wallet_address,
                 amount=self.blockchain.current_reward,
-                block_height=latest_block.index + 1
+                tx_type=TransactionType.COINBASE
             )
             transactions.insert(0, coinbase_tx)
-            self.current_block = Block(
+            block = Block(
                 index=latest_block.index + 1,
                 transactions=transactions,
                 previous_hash=latest_block.hash
             )
+            self._logger.info(f"Block {block.index} created with {len(transactions)} transactions")
+            return block
+        except Exception as e:
+            self._logger.error(f"Block creation error: {e}")
+            return None
 
-    async def stop_mining(self):
-        async with self._lock:
-            self._running = False
-            logger.info("Mining stopped")
-
-    async def _mine_current_block(self) -> bool:
-        async with self._lock:
-            if not self.current_block or not self._running:
-                return False
-            target = "0" * self.current_block.difficulty
+    def _mine_block(self, block):
+        """Synchronous block mining"""
+        self._logger.debug(f"Starting to mine block {block.index}")
+        try:
+            target = "0" * self.blockchain.difficulty
             nonce = 0
-            start_time = time.time()
-            logger.info(f"Starting to mine block {self.current_block.index} with difficulty {self.current_block.difficulty}")
-            while self._running:
-                self.current_block.nonce = nonce
-                block_hash = self.current_block.calculate_hash()
+            while self.mining and not self._stop_event.is_set():
+                block.nonce = nonce
+                block_hash = block.calculate_hash()
+                self.total_hashes += 1
+                self._logger.debug(f"Hash attempt: {self.total_hashes}, Hash: {block_hash[:10]}...")
                 if block_hash.startswith(target):
-                    self.current_block.hash = block_hash
-                    logger.info(f"Block {self.current_block.index} mined with hash {block_hash}")
+                    block.hash = block_hash
+                    self._logger.info(f"Block mined with nonce {nonce}")
                     return True
                 nonce += 1
                 if nonce % 10000 == 0:
-                    logger.debug(f"Reached nonce {nonce} for block {self.current_block.index}")
-                    elapsed = time.time() - start_time
-                    await asyncio.sleep(0.001)
-                    start_time = time.time()
+                    self._logger.debug(f"Nonce at {nonce}, hash: {block_hash[:10]}...")
+                    time.sleep(0.001)
+            self._logger.info("Mining stopped")
             return False
+        except Exception as e:
+            self._logger.error(f"Block mining error: {e}")
+            return False
+
+    async def _add_block_to_chain(self, block):
+        """Add block to blockchain asynchronously"""
+        self._logger.debug(f"Attempting to add block {block.index}")
+        try:
+            # Assuming self.loop is passed from BlockchainGUI or Blockchain.network.loop
+            if not self.loop or not self.loop.is_running():
+                self._logger.error("Event loop is not available or not running")
+                return False
+            success = await self.blockchain.add_block(block)
+            if success:
+                self.blocks_mined += 1
+                self._logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}")
+            else:
+                self._logger.warning(f"Failed to add block {block.index} to chain")
+            return success
+        except Exception as e:
+            self._logger.error(f"Failed to add block {block.index} to chain: {str(e)}")
+            return False
+
+    def get_hashrate(self):
+        if not self.mining or self.start_time == 0:
+            return 0.0
+        elapsed = time.time() - self.start_time
+        hashrate = self.total_hashes / elapsed if elapsed > 0 else 0.0
+        self._logger.debug(f"Hashrate: {hashrate}, Total Hashes: {self.total_hashes}, Elapsed: {elapsed}")
+        return hashrate
+    
 
 class NonceTracker:
     def __init__(self):
@@ -414,8 +708,85 @@ class NonceTracker:
             self.nonce_map[addr].remove(nonce)
             del self.nonce_expiry[(addr, nonce)]
 
+class NetworkService:
+    def __init__(self, blockchain_network=None):
+        self.network = blockchain_network
+        self.peers = set()
+        self.loop = None
+        self.message_handlers = {
+            'block': self._handle_block,
+            'transaction': self._handle_transaction,
+            'chain_request': self._handle_chain_request
+        }
+
+    async def start(self):
+        """Initialize the network service"""
+        self.loop = asyncio.get_event_loop()
+        if self.network:
+            await self.network.start()
+        logger.info("Network service started")
+
+    async def stop(self):
+        """Stop the network service"""
+        if self.network:
+            await self.network.stop()
+        logger.info("Network service stopped")
+
+    async def broadcast_block(self, block):
+        """Broadcast a new block to all peers"""
+        if self.network:
+            try:
+                await self.network.broadcast_block(block)
+                logger.info(f"Block {block.index} broadcasted to network")
+            except Exception as e:
+                logger.error(f"Failed to broadcast block: {e}")
+
+    async def broadcast_transaction(self, transaction):
+        """Broadcast a new transaction to all peers"""
+        if self.network:
+            try:
+                await self.network.broadcast_transaction(transaction)
+                logger.info(f"Transaction {transaction.tx_id} broadcasted to network")
+            except Exception as e:
+                logger.error(f"Failed to broadcast transaction: {e}")
+
+    async def request_chain(self):
+        """Request blockchain from peers"""
+        if self.network:
+            try:
+                await self.network.request_chain()
+                logger.info("Chain request sent to network")
+            except Exception as e:
+                logger.error(f"Failed to request chain: {e}")
+
+    async def _handle_block(self, block_data):
+        """Handle received block from network"""
+        try:
+            block = Block.from_dict(block_data)
+            await self.blockchain.add_block(block)
+        except Exception as e:
+            logger.error(f"Failed to handle received block: {e}")
+
+    async def _handle_transaction(self, tx_data):
+        """Handle received transaction from network"""
+        try:
+            transaction = Transaction.from_dict(tx_data)
+            await self.blockchain.add_transaction_to_mempool(transaction)
+        except Exception as e:
+            logger.error(f"Failed to handle received transaction: {e}")
+
+    async def _handle_chain_request(self, request_data):
+        """Handle chain request from peers"""
+        try:
+            if self.network:
+                chain_data = [block.to_dict() for block in self.blockchain.chain]
+                await self.network.send_chain(request_data['peer_id'], chain_data)
+        except Exception as e:
+            logger.error(f"Failed to handle chain request: {e}")
+
 class Blockchain:
     def __init__(self, mfa_manager=None, backup_manager=None, storage_path: str = "chain.db", node_id=None):
+        from network import BlockchainNetwork
         self.chain: List[Block] = []
         self.storage_path = storage_path
         self.difficulty = 4
@@ -427,7 +798,7 @@ class Blockchain:
         self.max_orphans = 100
         self._lock = asyncio.Lock()
         self.listeners = {"new_block": [], "new_transaction": []}
-        self.network = None
+        self.network = BlockchainNetwork(self, node_id or "default", "127.0.0.1", 5000)
         self.block_height = Gauge('blockchain_height', 'Current height of the blockchain')
         self.checkpoint_interval = 100
         self.checkpoints = [0]
@@ -440,6 +811,9 @@ class Blockchain:
         self.mining_thread = None
         self.mining_flag = threading.Event()
         self.create_genesis_block()
+        self._thread_lock = threading.Lock()  # Keep this for non-async operations
+        self._mining_pool = concurrent.futures.ProcessPoolExecutor()  # For mining
+        self.miner = AsyncMiner(self)
 
     async def initialize(self):
         """Initialize the blockchain database and load chain"""
@@ -640,6 +1014,7 @@ class Blockchain:
         async with self._lock:
             try:
                 if any(b.hash == block.hash for b in self.chain):
+                    logger.info(f"Block {block.index} already exists in chain: {block.hash[:8]}")
                     return False
                 if block.index == len(self.chain) and block.previous_hash == self.chain[-1].hash:
                     if await self.validate_block(block):
@@ -656,9 +1031,12 @@ class Blockchain:
                         self.update_metrics()
                         await self._process_orphans()
                         BLOCKS_MINED.inc()
-                        logger.info(f"Added block {block.index} to chain: {block.hash[:8]}")
+                        logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}, chain length: {len(self.chain)}")
                         return True
+                    else:
+                        logger.warning(f"Block {block.index} failed validation: {block.hash[:8]}")
                 else:
+                    logger.info(f"Block {block.index} doesn’t follow chain tip, handling as potential fork")
                     await self.handle_potential_fork(block)
                 return False
             except Exception as e:
@@ -971,144 +1349,272 @@ class Blockchain:
         """Get the latest block in the chain"""
         return self.chain[-1] if self.chain else None
 
-    def start_mining(self):
-        """Start the mining process in a separate thread"""
-        if self.mining_thread and self.mining_thread.is_alive():
-            logger.warning("Mining already in progress")
+    async def start_mining(self, wallet_address=None):
+        logger.info("Attempting to start mining...")
+        try:
+            if not wallet_address:
+                addresses = self.get_all_addresses()
+                if not addresses:
+                    logger.error("No wallet addresses available for mining")
+                    raise ValueError("No wallet addresses available")
+                wallet_address = addresses[0]
+            self.miner.wallet_address = wallet_address
+            result = self.miner.start_mining()  # Synchronous call
+            if result:
+                logger.info(f"Mining started successfully with address: {wallet_address}")
+                return True
+            logger.warning("Mining failed to start")
             return False
+        except Exception as e:
+            logger.error(f"Mining error: {e}")
+            return False
+
+    async def stop_mining(self):
+        """Stop the mining process and clean up resources"""
+        logger.info("Stopping mining...")
+        try:
+            # Stop the AsyncMiner
+            result = await self.miner.stop_mining()
+            if not result:
+                logger.warning("Miner failed to stop cleanly")
+                return False
             
-        self.mining_flag.set()
-        self.mining_thread = threading.Thread(target=self._mine_pending_transactions)
-        self.mining_thread.daemon = True
-        self.mining_thread.start()
-        logger.info("Mining process started")
-        return True
+            # Shut down Blockchain's mining pool
+            if hasattr(self, '_mining_pool') and self._mining_pool:
+                self._mining_pool.shutdown(wait=True)
+                logger.info("Blockchain mining process pool shut down")
+                self._mining_pool = None  # Clear reference
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to stop mining: {e}")
+            return False
 
-    def stop_mining(self):
-        """Stop the mining process"""
-        self.mining_flag.clear()
-        if self.mining_thread:
-            self.mining_thread.join(timeout=1)
-            self.mining_thread = None
-        logger.info("Mining process stopped")
-
-    def _mine_pending_transactions(self):
-        """Mining loop that runs in a separate thread"""
+    async def _mining_process(self):
+        """Async mining process"""
         while self.mining_flag.is_set():
-            if not self.pending_transactions:
-                time.sleep(1)  # Wait for transactions
-                continue
-                
             try:
-                # Create new block with pending transactions
-                new_block = Block(
-                    index=len(self.chain),
-                    transactions=self.pending_transactions.copy(),
-                    previous_hash=self.chain[-1].hash
+                # Create new block synchronously
+                block = self._create_new_block()
+                
+                # Do mining work in process pool
+                mining_result = await asyncio.get_event_loop().run_in_executor(
+                    self._mining_pool,
+                    self._do_mining_work,
+                    block,
+                    self.difficulty
                 )
                 
-                # Mine the block
-                success = new_block.mine_block(self.difficulty)
-                if success and self.mining_flag.is_set():
-                    with self._lock:
-                        self.chain.append(new_block)
+                if mining_result and self.mining_flag.is_set():
+                    # Add block to chain if mining was successful and still running
+                    success = await self.add_block(mining_result)
+                    if success:
+                        logger.info(f"Successfully mined and added block {mining_result.index}")
+                        # Clear any transactions that were included in this block
                         self.pending_transactions = []
-                        logger.info(f"Mined new block #{new_block.index} with hash {new_block.hash}")
-                        
-                    # Broadcast new block to network
-                    if hasattr(self, 'network'):
-                        asyncio.run_coroutine_threadsafe(
-                            self.network.broadcast_block(new_block),
-                            self.network.loop
-                        )
-                        
+                    
             except Exception as e:
                 logger.error(f"Mining error: {e}")
-                time.sleep(1)
+                await asyncio.sleep(1)
+            
+            # Small delay to prevent CPU hogging
+            await asyncio.sleep(0.1)
 
-    def validate_block(self, block: Block) -> bool:
-        """Validate a block's hash and transactions"""
-        # Check block hash
-        if not block.hash.startswith('0' * self.difficulty):
-            return False
-            
-        # Verify block hash matches its contents
-        if block.calculate_hash() != block.hash:
-            return False
-            
-        # Verify transactions
-        for tx in block.transactions:
-            if not self.validate_transaction(tx):
-                return False
+    def _do_mining_work(self, block: Block, difficulty: int) -> Optional[Block]:
+        """Synchronous mining calculations - runs in process pool"""
+        target = "0" * difficulty
+        max_nonce = 2**32  # Maximum nonce value
+        
+        for nonce in range(max_nonce):
+            if not self.mining_flag.is_set():
+                return None
                 
-        return True
+            block.nonce = nonce
+            block_hash = block.calculate_hash()
+            
+            if block_hash.startswith(target):
+                block.hash = block_hash
+                return block
+            
+            if nonce % 10000 == 0:
+                time.sleep(0.001)  # Prevent CPU hogging
+                
+        return None
 
-    def validate_transaction(self, transaction: Transaction) -> bool:
-        """Validate a transaction's signature and sender's balance"""
+    def _create_new_block(self) -> Block:
+        """Create a new block with pending transactions"""
+        if not self.chain:
+            return self.create_genesis_block()
+
+        last_block = self.chain[-1]
+        
+        # Create coinbase transaction for mining reward
+        coinbase_tx = Transaction(
+            sender="0",
+            recipient=self.mining_address,
+            amount=self.current_reward,
+            tx_type=TransactionType.COINBASE
+        )
+        
+        # Get pending transactions (limit to reasonable size)
+        transactions = self.pending_transactions[:10]  # Limit to 10 transactions per block
+        transactions.insert(0, coinbase_tx)  # Add coinbase transaction first
+        
+        # Create new block
+        new_block = Block(
+            index=len(self.chain),
+            transactions=transactions,
+            previous_hash=last_block.hash
+        )
+        new_block.difficulty = self.difficulty
+        new_block.timestamp = time.time()
+        
+        return new_block
+
+    async def get_hashrate(self) -> float:
+        if hasattr(self, 'miner'):
+            hashrate = self.miner.get_hashrate()  # Synchronous call is fine here since it's a simple calculation
+            logger.debug(f"Blockchain get_hashrate: {hashrate}")
+            return hashrate
+        logger.debug("No miner available, returning 0")
+        return 0.0
+        
+    async def create_coinbase_transaction(self, recipient: str, amount: float, block_height: int) -> Transaction:
+        """
+        Create a coinbase transaction for mining rewards
+        
+        :param recipient: Address receiving the mining reward
+        :param amount: Amount of the mining reward
+        :param block_height: Height of the block being mined
+        :return: Coinbase Transaction
+        """
         try:
-            # Skip validation for mining rewards
-            if transaction.sender is None:
-                return True
-                
-            # Verify signature
-            if not transaction.verify():
-                return False
-                
-            # Check sender has sufficient balance
-            sender_balance = self.get_balance(transaction.sender)
-            if sender_balance < transaction.amount:
-                return False
-                
-            return True
+            tx = Transaction(
+                sender="0",
+                recipient=recipient,
+                amount=amount,
+                tx_type=TransactionType.COINBASE
+            )
+            logger.info(f"Created coinbase transaction for block {block_height} to {recipient}")
+            return tx
         except Exception as e:
-            logger.error(f"Transaction validation error: {e}")
-            return False
+            logger.error(f"Failed to create coinbase transaction: {e}")
+            raise
 
-    def add_block(self, block: Block) -> bool:
-        """Add a new block to the chain after validation"""
-        try:
-            # Validate block
-            if not self.validate_block(block):
-                return False
-                
-            # Check block links to previous block
-            if block.previous_hash != self.chain[-1].hash:
-                return False
-                
-            # Add block to chain
-            with self._lock:
-                self.chain.append(block)
-                # Remove transactions that are now in the block
-                self.pending_transactions = [
-                    tx for tx in self.pending_transactions 
-                    if tx not in block.transactions
-                ]
-                
-            logger.info(f"Added block #{block.index} to chain")
-            return True
+class ResourceMonitor:
+    async def monitor_resources(self):
+        while True:
+            cpu_usage = psutil.cpu_percent()
+            memory_usage = psutil.virtual_memory().percent
             
-        except Exception as e:
-            logger.error(f"Error adding block: {e}")
-            return False
+            if cpu_usage > 90:  # Threshold
+                await self.adjust_mining_intensity()
+            
+            await asyncio.sleep(1)
 
-    def get_hashrate(self) -> float:
-        """Calculate current mining hashrate"""
-        # Simple hashrate calculation based on recent blocks
+class BlockchainNode:
+    def __init__(self):
+        from network import BlockchainNetwork
+        self.blockchain = Blockchain()
+        self.mining_service = MiningService(self.blockchain)
+        self.blockchain_network = BlockchainNetwork(self.blockchain)  # Create BlockchainNetwork instance
+        self.network_service = NetworkService(self.blockchain_network)  # Pass it to NetworkService
+        self.resource_monitor = ResourceMonitor()
+        
+        # Set up network reference in blockchain
+        self.blockchain.network = self.network_service
+
+    async def start(self):
+        """Start all services"""
         try:
-            if len(self.chain) < 2:
-                return 0
-                
-            recent_blocks = self.chain[-10:]  # Look at last 10 blocks
-            time_diff = (
-                datetime.datetime.fromisoformat(recent_blocks[-1].timestamp) -
-                datetime.datetime.fromisoformat(recent_blocks[0].timestamp)
-            ).total_seconds()
+            # Initialize blockchain first
+            await self.blockchain.initialize()
             
-            if time_diff <= 0:
-                return 0
-                
-            return len(recent_blocks) / time_diff * self.difficulty
-            
+            # Start all services
+            await asyncio.gather(
+                self.mining_service.start(),
+                self.network_service.start(),
+                self.resource_monitor.start()
+            )
+            logger.info("BlockchainNode started successfully")
         except Exception as e:
-            logger.error(f"Error calculating hashrate: {e}")
-            return 0
+            logger.error(f"Failed to start BlockchainNode: {e}")
+            raise
+
+    async def stop(self):
+        """Stop all services gracefully"""
+        try:
+            await self.network_service.stop()
+            await self.mining_service.stop_mining()
+            logger.info("BlockchainNode stopped successfully")
+        except Exception as e:
+            logger.error(f"Error during BlockchainNode shutdown: {e}")
+            raise
+
+    async def toggle_mining(self):
+        """Toggle mining state"""
+        if not self.mining:
+            if await self.blockchain.start_mining():  # Now properly awaited
+                self.mining = True
+                self.mining_btn.configure(text="Stop Mining")
+                self.status_var.set("Mining started")
+        else:
+            await self.blockchain.stop_mining()  # Make sure stop_mining is also async
+            self.mining = False
+            self.mining_btn.configure(text="Start Mining")
+            self.status_var.set("Mining stopped")
+
+    def init_mining_tab(self):
+        """Initialize mining control tab"""
+        mining_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(mining_frame, text="Mining")
+        
+        # Mining controls
+        controls_frame = ttk.LabelFrame(mining_frame, text="Mining Controls", padding="10")
+        controls_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        self.mining_btn = ttk.Button(
+            controls_frame,
+            text="Start Mining",
+            command=self._handle_mining_click,
+            style='Mining.TButton'
+        )
+        self.mining_btn.grid(row=0, column=0, padx=5, pady=5)
+
+    def _handle_mining_click(self):
+        """Handle mining button click"""
+        if not hasattr(self, 'mining_task'):
+            self.mining_task = None
+
+        if not self.mining:
+            # Cancel existing task if any
+            if self.mining_task:
+                self.mining_task.cancel()
+            
+            # Create new task
+            self.mining_task = asyncio.run_coroutine_threadsafe(
+                self.blockchain.start_mining(),
+                self.blockchain.network.loop
+            )
+            
+            # Set up callback
+            def mining_started(future):
+                try:
+                    if future.result():
+                        self.mining = True
+                        self.mining_btn.configure(text="Stop Mining")
+                        self.status_var.set("Mining started")
+                except Exception as e:
+                    logger.error(f"Mining start error: {e}")
+                    self.status_var.set(f"Mining failed: {str(e)}")
+                    
+            self.mining_task.add_done_callback(mining_started)
+        else:
+            # Stop mining
+            asyncio.run_coroutine_threadsafe(
+                self.blockchain.stop_mining(),
+                self.blockchain.network.loop
+            )
+            self.mining = False
+            self.mining_btn.configure(text="Start Mining")
+            self.status_var.set("Mining stopped")

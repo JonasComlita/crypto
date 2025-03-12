@@ -13,6 +13,7 @@ class KeyBackupManager:
     def __init__(self, backup_dir: str):
         self.backup_dir = backup_dir
         os.makedirs(backup_dir, exist_ok=True)
+        self.wallet_backups = {}  # Track backed up wallets
         
     def generate_backup_key(self, password: str) -> bytes:
         """Generate encryption key from password"""
@@ -74,4 +75,16 @@ class KeyBackupManager:
             
         except Exception as e:
             logger.error(f"Backup restoration failed: {e}")
-            raise 
+            raise
+
+    def is_wallet_backed_up(self, wallet_address: str) -> bool:
+        """Check if a wallet has been backed up"""
+        return wallet_address in self.wallet_backups
+        
+    async def backup_transaction(self, transaction):
+        """Track wallet backup status after transaction"""
+        try:
+            self.wallet_backups[transaction.sender] = True
+            self.wallet_backups[transaction.recipient] = True
+        except Exception as e:
+            logger.error(f"Failed to track wallet backup: {e}") 

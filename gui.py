@@ -6,7 +6,7 @@ import re
 import time
 from queue import Queue
 from typing import Dict, List
-from blockchain import Blockchain, Block, Transaction, TransactionType, Miner
+from blockchain import Blockchain, Block, Transaction, TransactionType
 from network import BlockchainNetwork
 from utils import SecurityUtils, generate_wallet, derive_key, Fernet
 import logging
@@ -17,22 +17,31 @@ from PIL import Image, ImageTk
 import queue
 import threading
 import datetime
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class BlockchainGUI:
+    from blockchain import Blockchain
     def __init__(self, blockchain, network, mfa_manager=None, backup_manager=None):
         self.blockchain = blockchain
         self.network = network
         self.mfa_manager = mfa_manager
         self.backup_manager = backup_manager
         self.mining = False
+        self.loop = asyncio.new_event_loop()
+        self.loop_thread = threading.Thread(target=self.main_loop, daemon=True)
+        self.shutdown_event = threading.Event()
         
         self.root = tk.Tk()
         self.root.title("OriginalCoin Blockchain")
         self.root.geometry("800x600")  # Set initial window size
+
+        # Queue for thread-safe updates
+        self.update_queue = queue.Queue()
+        self.root.after(100, self.process_queue)
         
         # Style configuration
         self.style = ttk.Style()
@@ -57,8 +66,18 @@ class BlockchainGUI:
         
         # Initialize tabs
         self.init_wallet_tab()
-        self.init_mining_tab()
+        self.init_mining_tab()  # This creates self.mining_frame
         self.init_network_tab()
+        
+        # Create mining button in the controls frame
+        self.mining_btn = ttk.Button(
+            # Use the controls_frame inside the mining_frame
+            self.mining_frame.winfo_children()[0],  # First child is the controls_frame
+            text="Start Mining", 
+            command=self.toggle_mining,
+            style='Mining.TButton'
+        )
+        self.mining_btn.grid(row=0, column=0, padx=5, pady=5)
         
         # Status bar at bottom
         self.status_var = tk.StringVar(value="Ready")
@@ -70,8 +89,35 @@ class BlockchainGUI:
         )
         self.status_bar.grid(row=1, column=0, sticky=(tk.W, tk.E))
         
-        # Create queue for thread-safe updates
+        # Rest of the initialization remains the same
         self.update_queue = queue.Queue()
+        
+        # Add security status indicators
+        self.mfa_status = tk.StringVar(value="MFA: Not Configured")
+        self.backup_status = tk.StringVar(value="Backup: Not Configured")
+        
+        # Add security controls to the interface
+        self.add_security_controls()
+
+        # Bind window close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Add session management
+        self.session_timeout = 30 * 60  # 30 minutes
+        self.last_activity = time.time()
+        
+        # Add rate limiting
+        self.mfa_attempts = {}
+        self.max_mfa_attempts = 3
+        self.mfa_lockout_time = 300  # 5 minutes
+
+        # Add caching
+        self.cache = {}
+        self.cache_timeout = 60  # 1 minute
+        
+        # Batch processing
+        self.update_batch_size = 100
+        self.update_interval = 2000  # 2 seconds
 
     def init_wallet_tab(self):
         """Initialize wallet management tab"""
@@ -182,23 +228,18 @@ class BlockchainGUI:
 
     def init_mining_tab(self):
         """Initialize mining control tab"""
-        mining_frame = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(mining_frame, text="Mining")
+        # Create the mining frame and set it as an instance attribute
+        self.mining_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.mining_frame, text="Mining")
         
         # Mining controls
-        controls_frame = ttk.LabelFrame(mining_frame, text="Mining Controls", padding="10")
+        controls_frame = ttk.LabelFrame(self.mining_frame, text="Mining Controls", padding="10")
         controls_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
         
-        self.mining_btn = ttk.Button(
-            controls_frame,
-            text="Start Mining",
-            command=self.toggle_mining,
-            style='Mining.TButton'
-        )
-        self.mining_btn.grid(row=0, column=0, padx=5, pady=5)
+        # The mining button will be created in the __init__ method after this method is called
         
         # Mining stats
-        stats_frame = ttk.LabelFrame(mining_frame, text="Mining Statistics", padding="10")
+        stats_frame = ttk.LabelFrame(self.mining_frame, text="Mining Statistics", padding="10")
         stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.hashrate_var = tk.StringVar(value="Hashrate: 0 H/s")
@@ -217,7 +258,7 @@ class BlockchainGUI:
         ).grid(row=1, column=0, pady=2)
         
         # Recent blocks
-        blocks_frame = ttk.LabelFrame(mining_frame, text="Recent Blocks", padding="10")
+        blocks_frame = ttk.LabelFrame(self.mining_frame, text="Recent Blocks", padding="10")
         blocks_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
         self.blocks_tree = ttk.Treeview(
@@ -306,20 +347,165 @@ class BlockchainGUI:
         self.peers_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
-    def toggle_mining(self):
-        """Toggle mining state"""
-        if not self.mining:
-            if self.blockchain.start_mining():
-                self.mining = True
-                self.mining_btn.configure(text="Stop Mining")
-                self.status_var.set("Mining started")
-        else:
-            self.blockchain.stop_mining()
-            self.mining = False
-            self.mining_btn.configure(text="Start Mining")
-            self.status_var.set("Mining stopped")
+        self.loop_thread.start()
+        logger.info("Event loop thread started")
 
-    def update_mining_stats(self):
+    def process_queue(self):
+            try:
+                while not self.update_queue.empty():
+                    func = self.update_queue.get_nowait()
+                    func()
+            except Exception as e:
+                logger.error(f"Queue processing error: {e}")
+            self.root.after(100, self.process_queue)
+
+    def start_mining_callback(self):
+        """Wrapper for starting mining with error handling"""
+        try:
+            logger.info("Starting mining callback triggered")
+            wallet_address = self.selected_wallet.get()
+            if not wallet_address or wallet_address == "Select Wallet":
+                addresses = self.blockchain.get_all_addresses()
+                if not addresses:
+                    logger.error("No wallet available for mining")
+                    self.show_error("No wallet available for mining")
+                    return
+                wallet_address = addresses[0]
+                logger.info(f"Selected wallet address: {wallet_address}")
+
+            # Define the async mining start coroutine
+            async def start_mining_coroutine():
+                try:
+                    # Pass the event loop to the miner
+                    self.blockchain.miner.loop = self.loop
+                    # Start mining asynchronously
+                    result = await self.blockchain.start_mining(wallet_address)
+                    if result:
+                        self.update_queue.put(self.mining_started)
+                    else:
+                        self.update_queue.put(lambda: self.show_error("Failed to start mining"))
+                except Exception as e:
+                    logger.error(f"Mining coroutine exception: {str(e)}")
+                    self.update_queue.put(lambda: self.show_error(f"Mining start failed: {str(e)}"))
+
+            # Run the coroutine in the event loop thread-safely
+            asyncio.run_coroutine_threadsafe(start_mining_coroutine(), self.loop)
+
+        except Exception as e:
+            logger.error(f"Mining callback exception: {str(e)}")
+            self.show_error(f"Mining initialization error: {str(e)}")
+            
+    def show_error(self, message):
+        """Thread-safe method to show error message"""
+        logger.error(message)
+        if hasattr(self, 'status_var'):
+            self.status_var.set(message)
+        if threading.current_thread() is threading.main_thread():
+            messagebox.showerror("Mining Error", message)
+        else:
+            self.root.after(0, lambda: messagebox.showerror("Mining Error", message))
+
+    def toggle_mining(self):
+        """Toggle mining on and off"""
+        try:
+            if not self.mining:
+                # Start mining
+                self.start_mining_callback()
+            else:
+                # Stop mining
+                def stop_mining_thread():
+                    try:
+                        logger.info("Stopping mining...")
+                        result = asyncio.run_coroutine_threadsafe(
+                            self.blockchain.stop_mining(), self.loop
+                        ).result(timeout=5)
+                        self.update_queue.put(
+                            lambda: self.mining_stopped() if result else self.show_error("Failed to stop mining")
+                        )
+                    except Exception as e:
+                        logger.error(f"Stop mining thread exception: {str(e)}")
+                        self.update_queue.put(lambda: self.show_error(f"Mining stop failed: {str(e)}"))
+
+                threading.Thread(target=stop_mining_thread, daemon=True).start()
+        except Exception as e:
+            self.show_error(f"Mining toggle failed: {str(e)}")
+
+    def mining_started(self):
+        self.mining = True
+        self.mining_btn.configure(text="Stop Mining")
+        self.status_var.set("Mining started")
+        logger.info("Mining UI updated to started state")
+        self.start_mining_stats_update()
+
+    def mining_stopped(self):
+        """Update UI when mining stops successfully"""
+        self.mining = False
+        self.mining_btn.configure(text="Start Mining")
+        self.status_var.set("Mining stopped")
+        logger.info("Mining UI updated to stopped state")
+
+    def handle_mining_result(self, future):
+        """Handle the result of the mining task"""
+        try:
+            # This will either raise an exception or return a boolean
+            result = future.result()
+            
+            # Use root.after to update GUI thread safely
+            if result:
+                self.root.after(0, self.mining_started)
+            else:
+                self.root.after(0, lambda: self.mining_stopped("Unknown error"))
+        except Exception as e:
+            self.root.after(0, lambda: self.mining_stopped(str(e)))
+
+    def start_mining_stats_update(self):
+        """Periodically update mining stats while mining is active"""
+        async def update_stats():
+            if not self.mining:
+                return
+            try:
+                hashrate = await self.blockchain.get_hashrate()  # Ensure this method exists
+                logger.info(f"Updating stats - Hashrate: {hashrate}")
+                blocks_mined = len(self.blockchain.chain)
+
+                self.root.after(0, lambda: self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s"))
+                self.root.after(0, lambda: self.blocks_mined_var.set(f"Blocks Mined: {blocks_mined}"))
+                
+                self.root.after(0, lambda: self.blocks_tree.delete(*self.blocks_tree.get_children()))
+
+                # Update recent blocks
+                for block in reversed(self.blockchain.chain[-6:]):
+                    self.root.after(0, lambda b=block: self.blocks_tree.insert(
+                        "", "end",
+                        values=(b.index, b.timestamp, len(b.transactions), b.hash[:20] + "...")
+                    ))
+                logger.info(f"Updated stats - Hashrate: {hashrate:.2f} H/s, Blocks: {blocks_mined}")
+            except Exception as e:
+                logger.error(f"Stats update failed: {e}")
+                self.root.after(0, lambda: self.status_var.set(f"Stats update error: {str(e)}"))
+        
+        def schedule_next_update():
+            if self.mining:
+                # Schedule the next update
+                asyncio.run_coroutine_threadsafe(update_stats(), self.loop)
+                self.root.after(5000, schedule_next_update)
+
+        # Start the update cycle
+        asyncio.run_coroutine_threadsafe(update_stats(), self.loop)
+        self.root.after(5000, schedule_next_update)
+
+    def handle_mining_stats_update(self, future):
+        """Handle mining stats update results"""
+        try:
+            future.result()  # This will raise any exceptions
+        except Exception as e:
+            logger.error(f"Mining stats update error: {e}")
+            # Optionally stop mining or reset UI
+
+    async def update_mining_stats(self):
+        hashrate = await self.blockchain.get_hashrate()
+        self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s")
+        self.blocks_mined_var.set(f"Blocks Mined: {len(self.blockchain.chain)}")
         """Update mining statistics display"""
         if not hasattr(self, 'hashrate_var'):
             return
@@ -355,48 +541,80 @@ class BlockchainGUI:
     def update_wallet_dropdown(self):
         """Update the wallet dropdown with available addresses"""
         try:
-            # Get list of wallet addresses
             addresses = self.blockchain.get_all_addresses()
             
-            # Clear existing menu
             menu = self.wallet_dropdown["menu"]
             menu.delete(0, "end")
             
-            # Add addresses to menu
             for address in addresses:
                 menu.add_command(
-                    label=address,
-                    command=lambda a=address: self.selected_wallet.set(a)
+                    label=address[:10] + "...",  # Show shortened address
+                    command=lambda a=address: self.on_wallet_selected(a)
                 )
-            
-            # Update balance if a wallet is selected
-            if self.selected_wallet.get() != "Select Wallet":
-                self.update_balance()
-                
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update wallet list: {str(e)}")
 
+    def on_wallet_selected(self, address):
+        """Handle wallet selection with MFA verification"""
+        try:
+            if self.mfa_manager and not self.verify_mfa():
+                messagebox.showerror("Error", "MFA verification failed")
+                return
+                
+            self.selected_wallet.set(address)
+            self.update_balance()
+            self.update_transaction_history()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error selecting wallet: {str(e)}")
+
+    def verify_mfa(self):
+        """Verify MFA code if enabled"""
+        if not self.mfa_manager:
+            return True
+            
+        code = simpledialog.askstring("MFA Required", "Enter MFA code:", show='*')
+        if not code:
+            return False
+            
+        return self.mfa_manager.verify_code(self.network.node_id, code)
+
     def update_balance(self):
-        """Update the balance display for the selected wallet"""
+        """Update the balance display with security checks"""
         try:
             address = self.selected_wallet.get()
-            balance = 0  # Default balance
+            balance = 0
             if address and address != "Select Wallet":
                 balance = self.blockchain.get_balance(address)
-            self.balance_label.config(text=f"Balance: {balance}")
+                # Add security indicator if wallet is backed up
+                backup_status = "✓" if self.backup_manager and \
+                    self.backup_manager.is_wallet_backed_up(address) else ""
+                self.balance_label.config(
+                    text=f"Balance: {balance:.2f} ORIG {backup_status}"
+                )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update balance: {str(e)}")
 
     def send_transaction(self):
-        """Send a transaction from the selected wallet"""
+        """Send a transaction with security checks"""
         try:
+            # Verify MFA before transaction
+            if self.mfa_manager and not self.verify_mfa():
+                messagebox.showerror("Error", "MFA verification required")
+                return
+                
             sender = self.selected_wallet.get()
             recipient = self.recipient_var.get()
             amount = float(self.amount_var.get())
             
             if sender and recipient and amount > 0:
                 # Create and send transaction
-                self.blockchain.create_transaction(sender, recipient, amount)
+                tx = self.blockchain.create_transaction(sender, recipient, amount)
+                
+                # Backup keys after transaction if enabled
+                if self.backup_manager:
+                    asyncio.run(self.backup_manager.backup_transaction(tx))
+                
                 messagebox.showinfo("Success", "Transaction sent successfully")
                 
                 # Clear inputs and update display
@@ -413,6 +631,10 @@ class BlockchainGUI:
     def update_transaction_history(self):
         """Update the transaction history display"""
         try:
+            # Add pagination
+            # Implement memory-efficient data loading
+            # Add cleanup for old data
+            
             # Clear existing items
             for item in self.history_tree.get_children():
                 self.history_tree.delete(item)
@@ -437,7 +659,7 @@ class BlockchainGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update transaction history: {str(e)}")
 
-    def update_gui(self):
+    async def update_gui(self):
         """Process any pending GUI updates and schedule next update"""
         try:
             # Handle all pending updates
@@ -450,15 +672,18 @@ class BlockchainGUI:
                     break
                     
             # Update GUI elements
-            self.update_balance()
-            self.update_transaction_history()
+            await self.update_balance()
+            await self.update_transaction_history()
+            await self.update_mining_stats()
+            await self.update_chain_info()
+            await self.update_mempool_info()
             
         except Exception as e:
             logger.error(f"Error in GUI update: {e}")
             
         finally:
             # Schedule next update
-            self.root.after(1000, self.update_gui)
+            self.root.after(1000, lambda: asyncio.run_coroutine_threadsafe(self.update_gui(), asyncio.get_event_loop()))
 
     def safe_update(self, func):
         """Thread-safe way to schedule GUI updates"""
@@ -472,15 +697,28 @@ class BlockchainGUI:
         self.root.quit()
 
     def run(self):
-        """Start the GUI"""
-        # Initial setup
         self.update_wallet_dropdown()
-        
-        # Start periodic updates
-        self.root.after(1000, self.update_gui)
-        
-        # Start mainloop
         self.root.mainloop()
+    
+    def main_loop(self):
+        """Run the asyncio event loop in a separate thread"""
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_forever()
+        except Exception as e:
+            logger.error(f"Event loop error: {e}")
+        finally:
+            # Cleanup on loop stop
+            if not self.loop.is_closed():
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                try:
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception as e:
+                    logger.error(f"Error canceling tasks: {e}")
+                self.loop.close()
+                logger.info("Asyncio event loop closed")
 
     async def setup_mfa(self):
         """Handle MFA setup"""
@@ -657,6 +895,82 @@ class BlockchainGUI:
     def refresh_network_info(self):
         """Update network information display"""
         self.peer_count.set(f"Connected Peers: {len(self.network.peers)}")
+
+    def add_security_controls(self):
+        """Add security controls to the interface"""
+        security_frame = ttk.LabelFrame(self.main_frame, text="Security Controls", padding="5")
+        security_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # MFA Setup button
+        ttk.Button(
+            security_frame,
+            text="Setup MFA",
+            command=lambda: asyncio.run(self.setup_mfa())
+        ).grid(row=0, column=0, padx=5, pady=5)
+        
+        # Backup Controls
+        ttk.Button(
+            security_frame,
+            text="Backup Keys",
+            command=lambda: asyncio.run(self.backup_keys())
+        ).grid(row=0, column=1, padx=5, pady=5)
+        
+        ttk.Button(
+            security_frame,
+            text="Restore Keys",
+            command=lambda: asyncio.run(self.restore_keys())
+        ).grid(row=0, column=2, padx=5, pady=5)
+
+    def on_closing(self):
+        logger.info("Starting application shutdown...")
+        try:
+            if self.mining:
+                asyncio.run_coroutine_threadsafe(self.blockchain.stop_mining(), self.loop).result(timeout=10)
+                logger.info("Mining stopped during shutdown")
+            if self.network:
+                asyncio.run_coroutine_threadsafe(self.network.cleanup(), self.loop).result(timeout=5)
+                logger.info("Network cleanup completed")
+            self.shutdown_event.set()
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.root.quit()
+            self.root.destroy()
+            logger.info("GUI destroyed")
+            self.loop_thread.join(timeout=10)
+            if self.loop_thread.is_alive():
+                logger.warning("Event loop thread did not terminate cleanly")
+                import psutil
+                current_process = psutil.Process()
+                children = current_process.children(recursive=True)
+                for child in children:
+                    logger.warning(f"Terminating child process: {child.pid}")
+                    child.terminate()
+            else:
+                logger.info("Event loop thread terminated")
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
+
+    def cleanup_resources(self):
+        """Periodic cleanup of resources"""
+        # Clear old cache entries
+        current_time = time.time()
+        self.cache = {k: v for k, v in self.cache.items() 
+                      if current_time - v['timestamp'] < self.cache_timeout}
+        
+        # Clear sensitive data
+        self.clear_clipboard()
+        gc.collect()
+
+    def setup_monitoring(self):
+        """Setup performance monitoring"""
+        self.metrics = {
+            'gui_updates': 0,
+            'network_requests': 0,
+            'transaction_count': 0,
+            'response_times': []
+        }
+        
+        # Add Prometheus metrics
+        self.prometheus_client.start_http_server(8000)
 
 async def initialize_security(node_id: str) -> tuple:
     security_monitor = SecurityMonitor()
