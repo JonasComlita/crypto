@@ -703,7 +703,7 @@ class KeyRotationManager:
             logger.error(f"Key rotation failed: {e}")
             raise
 
-    def get_backup_password(self) -> str:
+    async def get_backup_password(self) -> str:
         """Get password for key backup"""
         # In a production environment, this should be securely configured
         # For now, we'll use a simple derived password

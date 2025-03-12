@@ -77,7 +77,7 @@ class KeyBackupManager:
             logger.error(f"Backup restoration failed: {e}")
             raise
 
-    def is_wallet_backed_up(self, wallet_address: str) -> bool:
+    async def is_wallet_backed_up(self, wallet_address: str) -> bool:
         """Check if a wallet has been backed up"""
         return wallet_address in self.wallet_backups
         

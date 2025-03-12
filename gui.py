@@ -5,7 +5,7 @@ import json
 import re
 import time
 from queue import Queue
-from typing import Dict, List
+from typing import Dict, List, Optional
 from blockchain import Blockchain, Block, Transaction, TransactionType
 from network import BlockchainNetwork
 from utils import SecurityUtils, generate_wallet, derive_key, Fernet
@@ -118,6 +118,10 @@ class BlockchainGUI:
         # Batch processing
         self.update_batch_size = 100
         self.update_interval = 2000  # 2 seconds
+        
+        # Start the asyncio loop in a separate thread
+        self.loop_thread.start()
+        logger.info("Event loop thread started")
 
     def init_wallet_tab(self):
         """Initialize wallet management tab"""
@@ -347,17 +351,15 @@ class BlockchainGUI:
         self.peers_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
-        self.loop_thread.start()
-        logger.info("Event loop thread started")
-
     def process_queue(self):
-            try:
-                while not self.update_queue.empty():
-                    func = self.update_queue.get_nowait()
-                    func()
-            except Exception as e:
-                logger.error(f"Queue processing error: {e}")
-            self.root.after(100, self.process_queue)
+        """Process the update queue for thread-safe UI updates"""
+        try:
+            while not self.update_queue.empty():
+                func = self.update_queue.get_nowait()
+                func()
+        except Exception as e:
+            logger.error(f"Queue processing error: {e}")
+        self.root.after(100, self.process_queue)
 
     def start_mining_callback(self):
         """Wrapper for starting mining with error handling"""
@@ -365,20 +367,24 @@ class BlockchainGUI:
             logger.info("Starting mining callback triggered")
             wallet_address = self.selected_wallet.get()
             if not wallet_address or wallet_address == "Select Wallet":
-                addresses = self.blockchain.get_all_addresses()
-                if not addresses:
-                    logger.error("No wallet available for mining")
-                    self.show_error("No wallet available for mining")
+                # Run get_all_addresses async through the loop
+                async def get_addresses():
+                    addresses = await self.blockchain.get_all_addresses()
+                    if not addresses:
+                        self.update_queue.put(lambda: self.show_error("No wallet available for mining"))
+                        return None
+                    return addresses[0]
+                
+                # Get the result and continue with mining
+                future = asyncio.run_coroutine_threadsafe(get_addresses(), self.loop)
+                wallet_address = future.result(timeout=5)
+                if not wallet_address:
                     return
-                wallet_address = addresses[0]
                 logger.info(f"Selected wallet address: {wallet_address}")
 
             # Define the async mining start coroutine
             async def start_mining_coroutine():
                 try:
-                    # Pass the event loop to the miner
-                    self.blockchain.miner.loop = self.loop
-                    # Start mining asynchronously
                     result = await self.blockchain.start_mining(wallet_address)
                     if result:
                         self.update_queue.put(self.mining_started)
@@ -401,9 +407,9 @@ class BlockchainGUI:
         if hasattr(self, 'status_var'):
             self.status_var.set(message)
         if threading.current_thread() is threading.main_thread():
-            messagebox.showerror("Mining Error", message)
+            messagebox.showerror("Error", message)
         else:
-            self.root.after(0, lambda: messagebox.showerror("Mining Error", message))
+            self.root.after(0, lambda: messagebox.showerror("Error", message))
 
     def toggle_mining(self):
         """Toggle mining on and off"""
@@ -431,6 +437,7 @@ class BlockchainGUI:
             self.show_error(f"Mining toggle failed: {str(e)}")
 
     def mining_started(self):
+        """Update UI when mining starts successfully"""
         self.mining = True
         self.mining_btn.configure(text="Stop Mining")
         self.status_var.set("Mining started")
@@ -444,45 +451,24 @@ class BlockchainGUI:
         self.status_var.set("Mining stopped")
         logger.info("Mining UI updated to stopped state")
 
-    def handle_mining_result(self, future):
-        """Handle the result of the mining task"""
-        try:
-            # This will either raise an exception or return a boolean
-            result = future.result()
-            
-            # Use root.after to update GUI thread safely
-            if result:
-                self.root.after(0, self.mining_started)
-            else:
-                self.root.after(0, lambda: self.mining_stopped("Unknown error"))
-        except Exception as e:
-            self.root.after(0, lambda: self.mining_stopped(str(e)))
-
     def start_mining_stats_update(self):
         """Periodically update mining stats while mining is active"""
         async def update_stats():
             if not self.mining:
                 return
             try:
-                hashrate = await self.blockchain.get_hashrate()  # Ensure this method exists
-                logger.info(f"Updating stats - Hashrate: {hashrate}")
+                hashrate = await self.blockchain.get_hashrate()
                 blocks_mined = len(self.blockchain.chain)
 
-                self.root.after(0, lambda: self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s"))
-                self.root.after(0, lambda: self.blocks_mined_var.set(f"Blocks Mined: {blocks_mined}"))
+                self.update_queue.put(lambda: self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s"))
+                self.update_queue.put(lambda: self.blocks_mined_var.set(f"Blocks Mined: {blocks_mined}"))
                 
-                self.root.after(0, lambda: self.blocks_tree.delete(*self.blocks_tree.get_children()))
-
                 # Update recent blocks
-                for block in reversed(self.blockchain.chain[-6:]):
-                    self.root.after(0, lambda b=block: self.blocks_tree.insert(
-                        "", "end",
-                        values=(b.index, b.timestamp, len(b.transactions), b.hash[:20] + "...")
-                    ))
+                self.update_queue.put(lambda: self.update_blocks_tree(self.blockchain.chain[-6:]))
                 logger.info(f"Updated stats - Hashrate: {hashrate:.2f} H/s, Blocks: {blocks_mined}")
             except Exception as e:
                 logger.error(f"Stats update failed: {e}")
-                self.root.after(0, lambda: self.status_var.set(f"Stats update error: {str(e)}"))
+                self.update_queue.put(lambda: self.status_var.set(f"Stats update error: {str(e)}"))
         
         def schedule_next_update():
             if self.mining:
@@ -494,65 +480,65 @@ class BlockchainGUI:
         asyncio.run_coroutine_threadsafe(update_stats(), self.loop)
         self.root.after(5000, schedule_next_update)
 
-    def handle_mining_stats_update(self, future):
-        """Handle mining stats update results"""
-        try:
-            future.result()  # This will raise any exceptions
-        except Exception as e:
-            logger.error(f"Mining stats update error: {e}")
-            # Optionally stop mining or reset UI
-
-    async def update_mining_stats(self):
-        hashrate = await self.blockchain.get_hashrate()
-        self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s")
-        self.blocks_mined_var.set(f"Blocks Mined: {len(self.blockchain.chain)}")
-        """Update mining statistics display"""
-        if not hasattr(self, 'hashrate_var'):
-            return
-            
-        hashrate = self.blockchain.get_hashrate()
-        self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s")
-        self.blocks_mined_var.set(f"Blocks Mined: {len(self.blockchain.chain)}")
-        
-        # Update recent blocks display
+    def update_blocks_tree(self, blocks):
+        """Update the blocks tree with the given blocks"""
         self.blocks_tree.delete(*self.blocks_tree.get_children())
-        for block in reversed(self.blockchain.chain[-6:]):
+        for block in reversed(blocks):
             self.blocks_tree.insert(
-                "",
-                0,
-                values=(
-                    block.index,
-                    block.timestamp,
-                    len(block.transactions),
-                    block.hash[:20] + "..."
-                )
+                "", "end",
+                values=(block.index, block.timestamp, len(block.transactions), block.hash[:20] + "...")
             )
 
     def create_new_wallet(self):
         """Create a new wallet"""
         try:
-            address = self.blockchain.create_wallet()
-            self.update_wallet_dropdown()
-            self.selected_wallet.set(address)
-            self.status_var.set(f"Created new wallet: {address[:10]}...")
+            # Define the async wallet creation coroutine
+            async def create_wallet_coroutine():
+                try:
+                    address = await self.blockchain.create_wallet()
+                    self.update_queue.put(lambda: self.wallet_created(address))
+                except Exception as e:
+                    logger.error(f"Wallet creation exception: {str(e)}")
+                    self.update_queue.put(lambda: self.show_error(f"Wallet creation failed: {str(e)}"))
+
+            # Run the coroutine in the event loop thread-safely
+            asyncio.run_coroutine_threadsafe(create_wallet_coroutine(), self.loop)
         except Exception as e:
-            self.status_var.set(f"Error creating wallet: {str(e)}")
+            self.show_error(f"Wallet creation error: {str(e)}")
+
+    def wallet_created(self, address):
+        """Handle successful wallet creation"""
+        self.update_wallet_dropdown()
+        self.selected_wallet.set(address)
+        self.status_var.set(f"Created new wallet: {address[:10]}...")
 
     def update_wallet_dropdown(self):
         """Update the wallet dropdown with available addresses"""
         try:
-            addresses = self.blockchain.get_all_addresses()
-            
-            menu = self.wallet_dropdown["menu"]
-            menu.delete(0, "end")
-            
-            for address in addresses:
-                menu.add_command(
-                    label=address[:10] + "...",  # Show shortened address
-                    command=lambda a=address: self.on_wallet_selected(a)
-                )
+            # Define the async address fetch coroutine
+            async def fetch_addresses_coroutine():
+                try:
+                    addresses = await self.blockchain.get_all_addresses()
+                    self.update_queue.put(lambda: self.populate_wallet_dropdown(addresses))
+                except Exception as e:
+                    logger.error(f"Address fetch exception: {str(e)}")
+                    self.update_queue.put(lambda: self.show_error(f"Failed to get wallet addresses: {str(e)}"))
+
+            # Run the coroutine in the event loop thread-safely
+            asyncio.run_coroutine_threadsafe(fetch_addresses_coroutine(), self.loop)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to update wallet list: {str(e)}")
+            self.show_error(f"Wallet dropdown update error: {str(e)}")
+
+    def populate_wallet_dropdown(self, addresses):
+        """Populate the wallet dropdown with the given addresses"""
+        menu = self.wallet_dropdown["menu"]
+        menu.delete(0, "end")
+        
+        for address in addresses:
+            menu.add_command(
+                label=address[:10] + "...",  # Show shortened address
+                command=lambda a=address: self.on_wallet_selected(a)
+            )
 
     def on_wallet_selected(self, address):
         """Handle wallet selection with MFA verification"""
@@ -562,8 +548,13 @@ class BlockchainGUI:
                 return
                 
             self.selected_wallet.set(address)
-            self.update_balance()
-            self.update_transaction_history()
+            
+            # Update balance and transaction history asynchronously
+            async def update_wallet_info():
+                await self.update_async_balance(address)
+                await self.update_async_transaction_history(address)
+            
+            asyncio.run_coroutine_threadsafe(update_wallet_info(), self.loop)
             
         except Exception as e:
             messagebox.showerror("Error", f"Error selecting wallet: {str(e)}")
@@ -579,21 +570,53 @@ class BlockchainGUI:
             
         return self.mfa_manager.verify_code(self.network.node_id, code)
 
-    def update_balance(self):
-        """Update the balance display with security checks"""
+    async def update_async_balance(self, address):
+        """Update the balance display asynchronously"""
         try:
-            address = self.selected_wallet.get()
-            balance = 0
-            if address and address != "Select Wallet":
-                balance = self.blockchain.get_balance(address)
-                # Add security indicator if wallet is backed up
-                backup_status = "✓" if self.backup_manager and \
-                    self.backup_manager.is_wallet_backed_up(address) else ""
-                self.balance_label.config(
-                    text=f"Balance: {balance:.2f} ORIG {backup_status}"
-                )
+            balance = await self.blockchain.get_balance(address)
+            
+            # Add security indicator if wallet is backed up
+            backup_status = ""
+            if self.backup_manager:
+                is_backed_up = await self.backup_manager.is_wallet_backed_up(address)
+                if is_backed_up:
+                    backup_status = "✓"
+                    
+            balance_text = f"Balance: {balance:.2f} ORIG {backup_status}"
+            self.update_queue.put(lambda: self.balance_label.config(text=balance_text))
+            
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to update balance: {str(e)}")
+            logger.error(f"Balance update error: {str(e)}")
+            self.update_queue.put(lambda: self.show_error(f"Failed to update balance: {str(e)}"))
+
+    async def update_async_transaction_history(self, address):
+        """Update the transaction history asynchronously"""
+        try:
+            transactions = await self.blockchain.get_transactions_for_address(address)
+            
+            # Update the GUI from the main thread
+            def update_history_tree():
+                # Clear existing items
+                self.history_tree.delete(*self.history_tree.get_children())
+                
+                # Add transactions to tree
+                for tx in transactions:
+                    self.history_tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            tx.timestamp,
+                            tx.sender[:10] + "..." if tx.sender else "Coinbase",
+                            tx.recipient[:10] + "..." if tx.recipient else "N/A",
+                            tx.amount
+                        )
+                    )
+                    
+            self.update_queue.put(update_history_tree)
+            
+        except Exception as e:
+            logger.error(f"Transaction history update error: {str(e)}")
+            self.update_queue.put(lambda: self.show_error(f"Failed to update transaction history: {str(e)}"))
 
     def send_transaction(self):
         """Send a transaction with security checks"""
@@ -605,101 +628,66 @@ class BlockchainGUI:
                 
             sender = self.selected_wallet.get()
             recipient = self.recipient_var.get()
-            amount = float(self.amount_var.get())
             
+            try:
+                amount = float(self.amount_var.get())
+            except ValueError:
+                messagebox.showerror("Error", "Invalid amount")
+                return
+                
             if sender and recipient and amount > 0:
-                # Create and send transaction
-                tx = self.blockchain.create_transaction(sender, recipient, amount)
+                # Get sender's wallet info
+                async def send_transaction_async():
+                    try:
+                        wallet = await self.blockchain.get_wallet(sender)
+                        if not wallet:
+                            self.update_queue.put(lambda: messagebox.showerror("Error", "Wallet not found"))
+                            return
+                            
+                        # Create and send transaction
+                        tx = await self.blockchain.create_transaction(
+                            wallet['private_key'],
+                            sender,
+                            recipient,
+                            amount,
+                            fee=0.001
+                        )
+                        
+                        if not tx:
+                            self.update_queue.put(lambda: messagebox.showerror("Error", "Failed to create transaction"))
+                            return
+                            
+                        # Add to mempool
+                        success = await self.blockchain.add_transaction_to_mempool(tx)
+                        
+                        if success:
+                            # Backup keys after transaction if enabled
+                            if self.backup_manager:
+                                await self.backup_manager.backup_transaction(tx)
+                            
+                            self.update_queue.put(lambda: messagebox.showinfo("Success", "Transaction sent successfully"))
+                            
+                            # Clear inputs and update display
+                            self.update_queue.put(lambda: self.amount_var.set(""))
+                            self.update_queue.put(lambda: self.recipient_var.set(""))
+                            
+                            # Update balance and transaction history
+                            await self.update_async_balance(sender)
+                            await self.update_async_transaction_history(sender)
+                        else:
+                            self.update_queue.put(lambda: messagebox.showerror("Error", "Transaction rejected by mempool"))
+                    except Exception as e:
+                        logger.error(f"Transaction send error: {str(e)}")
+                        self.update_queue.put(lambda: messagebox.showerror("Error", f"Transaction failed: {str(e)}"))
                 
-                # Backup keys after transaction if enabled
-                if self.backup_manager:
-                    asyncio.run(self.backup_manager.backup_transaction(tx))
-                
-                messagebox.showinfo("Success", "Transaction sent successfully")
-                
-                # Clear inputs and update display
-                self.amount_var.set("")
-                self.recipient_var.set("")
-                self.update_balance()
-                self.update_transaction_history()
+                # Run the transaction in the event loop
+                asyncio.run_coroutine_threadsafe(send_transaction_async(), self.loop)
             else:
                 messagebox.showerror("Error", "Please fill all fields correctly")
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send transaction: {str(e)}")
 
-    def update_transaction_history(self):
-        """Update the transaction history display"""
-        try:
-            # Add pagination
-            # Implement memory-efficient data loading
-            # Add cleanup for old data
-            
-            # Clear existing items
-            for item in self.history_tree.get_children():
-                self.history_tree.delete(item)
-            
-            # Get transactions for selected wallet
-            address = self.selected_wallet.get()
-            if address and address != "Select Wallet":
-                transactions = self.blockchain.get_transactions_for_address(address)
-                
-                # Add transactions to tree
-                for tx in transactions:
-                    self.history_tree.insert(
-                        "",
-                        "end",
-                        values=(
-                            tx.timestamp,
-                            tx.sender[:10] + "...",
-                            tx.recipient[:10] + "...",
-                            tx.amount
-                        )
-                    )
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to update transaction history: {str(e)}")
-
-    async def update_gui(self):
-        """Process any pending GUI updates and schedule next update"""
-        try:
-            # Handle all pending updates
-            while True:
-                try:
-                    # Non-blocking queue check
-                    update_func = self.update_queue.get_nowait()
-                    update_func()
-                except queue.Empty:
-                    break
-                    
-            # Update GUI elements
-            await self.update_balance()
-            await self.update_transaction_history()
-            await self.update_mining_stats()
-            await self.update_chain_info()
-            await self.update_mempool_info()
-            
-        except Exception as e:
-            logger.error(f"Error in GUI update: {e}")
-            
-        finally:
-            # Schedule next update
-            self.root.after(1000, lambda: asyncio.run_coroutine_threadsafe(self.update_gui(), asyncio.get_event_loop()))
-
-    def safe_update(self, func):
-        """Thread-safe way to schedule GUI updates"""
-        self.update_queue.put(func)
-
-    def exit(self):
-        try:
-            asyncio.run_coroutine_threadsafe(self.miner.stop_mining(), self.network.loop)
-        except Exception as e:
-            logger.error(f"Error stopping miner during exit: {e}")
-        self.root.quit()
-
-    def run(self):
-        self.update_wallet_dropdown()
-        self.root.mainloop()
-    
     def main_loop(self):
         """Run the asyncio event loop in a separate thread"""
         asyncio.set_event_loop(self.loop)
@@ -733,10 +721,11 @@ class BlockchainGUI:
             )
             
             # Show QR code in a new window
-            self.show_qr_code(qr_code)
+            self.update_queue.put(lambda: self.show_qr_code(qr_code))
             
         except Exception as e:
-            messagebox.showerror("MFA Setup Error", str(e))
+            logger.error(f"MFA setup error: {e}")
+            self.update_queue.put(lambda: messagebox.showerror("MFA Setup Error", str(e)))
 
     async def backup_keys(self):
         """Handle key backup"""
@@ -744,18 +733,33 @@ class BlockchainGUI:
             return
             
         try:
-            password = self.get_backup_password()
+            # Get password from UI thread
+            password_future = asyncio.Future()
+            self.update_queue.put(lambda: self.get_backup_password_wrapper(password_future))
+            
+            # Wait for password input
+            password = await password_future
             if not password:
                 return
                 
+            # Execute backup
             await self.backup_manager.create_backup(
                 self.network.get_keys(),
                 password
             )
-            messagebox.showinfo("Success", "Keys backed up successfully")
+            
+            # Update UI
+            self.update_queue.put(lambda: messagebox.showinfo("Success", "Keys backed up successfully"))
             
         except Exception as e:
-            messagebox.showerror("Backup Error", str(e))
+            logger.error(f"Backup error: {e}")
+            self.update_queue.put(lambda: messagebox.showerror("Backup Error", str(e)))
+
+    def get_backup_password_wrapper(self, future):
+        """UI thread wrapper for getting backup password"""
+        password = self.get_backup_password()
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(lambda: future.set_result(password))
 
     async def restore_keys(self):
         """Handle key restoration"""
@@ -763,22 +767,43 @@ class BlockchainGUI:
             return
             
         try:
-            password = self.get_backup_password()
+            # Get password from UI thread
+            password_future = asyncio.Future()
+            self.update_queue.put(lambda: self.get_backup_password_wrapper(password_future))
+            
+            # Wait for password input
+            password = await password_future
             if not password:
                 return
                 
-            file_path = filedialog.askopenfilename(
-                title="Select Backup File",
-                filetypes=[("Encrypted Backup", "*.enc")]
-            )
+            # Get file path from UI thread
+            file_path_future = asyncio.Future()
+            self.update_queue.put(lambda: self.get_file_path_wrapper(file_path_future))
             
-            if file_path:
-                keys = await self.backup_manager.restore_backup(file_path, password)
-                await self.network.restore_keys(keys)
-                messagebox.showinfo("Success", "Keys restored successfully")
+            # Wait for file path selection
+            file_path = await file_path_future
+            if not file_path:
+                return
+                
+            # Execute restore
+            keys = await self.backup_manager.restore_backup(file_path, password)
+            await self.network.restore_keys(keys)
+            
+            # Update UI
+            self.update_queue.put(lambda: messagebox.showinfo("Success", "Keys restored successfully"))
                 
         except Exception as e:
-            messagebox.showerror("Restore Error", str(e))
+            logger.error(f"Restore error: {e}")
+            self.update_queue.put(lambda: messagebox.showerror("Restore Error", str(e)))
+
+    def get_file_path_wrapper(self, future):
+        """UI thread wrapper for getting file path"""
+        file_path = filedialog.askopenfilename(
+            title="Select Backup File",
+            filetypes=[("Encrypted Backup", "*.enc")]
+        )
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(lambda: future.set_result(file_path))
 
     def get_backup_password(self) -> str:
         """Get password from user for backup/restore"""
@@ -807,135 +832,88 @@ class BlockchainGUI:
             text="Scan this QR code with your authenticator app"
         ).pack(padx=10, pady=5)
 
-    def create_blockchain_tab(self):
-        """Create the blockchain information tab"""
-        blockchain_tab = ttk.Frame(self.notebook)
-        self.notebook.add(blockchain_tab, text="Blockchain")
-        
-        # Blockchain Info Frame
-        info_frame = ttk.LabelFrame(blockchain_tab, text="Blockchain Info")
-        info_frame.pack(fill="x", padx=5, pady=5)
-        
-        # Add blockchain information
-        self.chain_length = tk.StringVar(value="Chain Length: 0")
-        ttk.Label(info_frame, textvariable=self.chain_length).pack(pady=5)
-        
-        self.last_block = tk.StringVar(value="Last Block: None")
-        ttk.Label(info_frame, textvariable=self.last_block).pack(pady=5)
-        
-        # Add refresh button
-        ttk.Button(
-            info_frame,
-            text="Refresh",
-            command=self.refresh_blockchain_info
-        ).pack(pady=5)
-
-    def create_network_tab(self):
-        """Create the network information tab"""
-        network_tab = ttk.Frame(self.notebook)
-        self.notebook.add(network_tab, text="Network")
-        
-        # Network Info Frame
-        info_frame = ttk.LabelFrame(network_tab, text="Network Info")
-        info_frame.pack(fill="x", padx=5, pady=5)
-        
-        # Add network information
-        self.node_id = tk.StringVar(value=f"Node ID: {self.network.node_id}")
-        ttk.Label(info_frame, textvariable=self.node_id).pack(pady=5)
-        
-        self.peer_count = tk.StringVar(value="Connected Peers: 0")
-        ttk.Label(info_frame, textvariable=self.peer_count).pack(pady=5)
-        
-        # Add refresh button
-        ttk.Button(
-            info_frame,
-            text="Refresh",
-            command=self.refresh_network_info
-        ).pack(pady=5)
-
-    def create_transaction_tab(self):
-        """Create the transaction management tab"""
-        transaction_tab = ttk.Frame(self.notebook)
-        self.notebook.add(transaction_tab, text="Transactions")
-        
-        # Transaction Creation Frame
-        create_frame = ttk.LabelFrame(transaction_tab, text="Create Transaction")
-        create_frame.pack(fill="x", padx=5, pady=5)
-        
-        # Add transaction form
-        ttk.Label(create_frame, text="Recipient:").pack(pady=2)
-        self.recipient_entry = ttk.Entry(create_frame)
-        self.recipient_entry.pack(fill="x", padx=5, pady=2)
-        
-        ttk.Label(create_frame, text="Amount:").pack(pady=2)
-        self.amount_entry = ttk.Entry(create_frame)
-        self.amount_entry.pack(fill="x", padx=5, pady=2)
-        
-        ttk.Button(
-            create_frame,
-            text="Send Transaction",
-            command=self.send_transaction
-        ).pack(pady=5)
-        
-        # Transaction History Frame
-        history_frame = ttk.LabelFrame(transaction_tab, text="Transaction History")
-        history_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Add transaction history list
-        self.transaction_list = tk.Listbox(history_frame)
-        self.transaction_list.pack(fill="both", expand=True, padx=5, pady=5)
-
-    def refresh_blockchain_info(self):
-        """Update blockchain information display"""
-        self.chain_length.set(f"Chain Length: {len(self.blockchain.chain)}")
-        if self.blockchain.chain:
-            last_block = self.blockchain.chain[-1]
-            self.last_block.set(f"Last Block: {last_block.hash[:10]}...")
-
-    def refresh_network_info(self):
-        """Update network information display"""
-        self.peer_count.set(f"Connected Peers: {len(self.network.peers)}")
-
     def add_security_controls(self):
         """Add security controls to the interface"""
         security_frame = ttk.LabelFrame(self.main_frame, text="Security Controls", padding="5")
         security_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         # MFA Setup button
-        ttk.Button(
+        mfa_btn = ttk.Button(
             security_frame,
             text="Setup MFA",
-            command=lambda: asyncio.run(self.setup_mfa())
-        ).grid(row=0, column=0, padx=5, pady=5)
+            command=self.handle_mfa_setup
+        )
+        mfa_btn.grid(row=0, column=0, padx=5, pady=5)
         
         # Backup Controls
-        ttk.Button(
+        backup_btn = ttk.Button(
             security_frame,
             text="Backup Keys",
-            command=lambda: asyncio.run(self.backup_keys())
-        ).grid(row=0, column=1, padx=5, pady=5)
+            command=self.handle_backup_keys
+        )
+        backup_btn.grid(row=0, column=1, padx=5, pady=5)
         
-        ttk.Button(
+        restore_btn = ttk.Button(
             security_frame,
             text="Restore Keys",
-            command=lambda: asyncio.run(self.restore_keys())
-        ).grid(row=0, column=2, padx=5, pady=5)
+            command=self.handle_restore_keys
+        )
+        restore_btn.grid(row=0, column=2, padx=5, pady=5)
+
+    def handle_mfa_setup(self):
+        """Handle MFA setup button click"""
+        asyncio.run_coroutine_threadsafe(self.setup_mfa(), self.loop)
+
+    def handle_backup_keys(self):
+        """Handle backup keys button click"""
+        asyncio.run_coroutine_threadsafe(self.backup_keys(), self.loop)
+
+    def handle_restore_keys(self):
+        """Handle restore keys button click"""
+        asyncio.run_coroutine_threadsafe(self.restore_keys(), self.loop)
 
     def on_closing(self):
+        """Handle application shutdown"""
         logger.info("Starting application shutdown...")
         try:
-            if self.mining:
-                asyncio.run_coroutine_threadsafe(self.blockchain.stop_mining(), self.loop).result(timeout=10)
-                logger.info("Mining stopped during shutdown")
-            if self.network:
-                asyncio.run_coroutine_threadsafe(self.network.cleanup(), self.loop).result(timeout=5)
-                logger.info("Network cleanup completed")
-            self.shutdown_event.set()
-            self.loop.call_soon_threadsafe(self.loop.stop)
+            # Show shutdown message
+            self.status_var.set("Shutting down...")
+            
+            # Define cleanup coroutine
+            async def cleanup():
+                try:
+                    # Stop mining if active
+                    if self.mining:
+                        await self.blockchain.stop_mining()
+                        logger.info("Mining stopped during shutdown")
+                        
+                    # Network cleanup
+                    if self.network:
+                        await self.network.cleanup()
+                        logger.info("Network cleanup completed")
+                        
+                    # Blockchain shutdown
+                    if hasattr(self.blockchain, 'shutdown'):
+                        await self.blockchain.shutdown()
+                        logger.info("Blockchain shutdown completed")
+                except Exception as e:
+                    logger.error(f"Cleanup error: {e}")
+                finally:
+                    # Signal event loop to stop
+                    self.shutdown_event.set()
+                    self.loop.stop()
+            
+            # Run cleanup in event loop and wait for it to complete
+            future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
+            future.result(timeout=10)
+            
+            # Destroy GUI
             self.root.quit()
             self.root.destroy()
             logger.info("GUI destroyed")
-            self.loop_thread.join(timeout=10)
+            
+            # Wait for event loop thread to end
+            self.loop_thread.join(timeout=5)
             if self.loop_thread.is_alive():
                 logger.warning("Event loop thread did not terminate cleanly")
                 import psutil
@@ -946,8 +924,12 @@ class BlockchainGUI:
                     child.terminate()
             else:
                 logger.info("Event loop thread terminated")
+                
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
+            # Force exit in case of serious errors
+            import os
+            os._exit(1)
 
     def cleanup_resources(self):
         """Periodic cleanup of resources"""
@@ -956,23 +938,32 @@ class BlockchainGUI:
         self.cache = {k: v for k, v in self.cache.items() 
                       if current_time - v['timestamp'] < self.cache_timeout}
         
-        # Clear sensitive data
-        self.clear_clipboard()
+        # Clear sensitive data from memory
+        if hasattr(self, 'clear_clipboard'):
+            self.clear_clipboard()
+            
+        # Force garbage collection
         gc.collect()
 
-    def setup_monitoring(self):
-        """Setup performance monitoring"""
-        self.metrics = {
-            'gui_updates': 0,
-            'network_requests': 0,
-            'transaction_count': 0,
-            'response_times': []
-        }
+    def clear_clipboard(self):
+        """Clear sensitive data from clipboard"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("")
+        except Exception as e:
+            logger.error(f"Failed to clear clipboard: {e}")
+
+    def run(self):
+        """Run the blockchain GUI"""
+        # Initial data loading
+        self.update_wallet_dropdown()
         
-        # Add Prometheus metrics
-        self.prometheus_client.start_http_server(8000)
+        # Start UI main loop
+        self.root.mainloop()
+
 
 async def initialize_security(node_id: str) -> tuple:
+    """Initialize security components"""
     security_monitor = SecurityMonitor()
     mfa_manager = MFAManager()
     backup_manager = KeyBackupManager(

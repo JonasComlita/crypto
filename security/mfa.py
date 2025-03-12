@@ -12,13 +12,13 @@ class MFAManager:
         self.verified_sessions = {}
         self.mfa_secrets = {}
         
-    def generate_mfa_secret(self, user_id: str) -> str:
+    async def generate_mfa_secret(self, user_id: str) -> str:
         """Generate new MFA secret for a user"""
         secret = pyotp.random_base32()
         self.mfa_secrets[user_id] = secret
         return secret
         
-    def get_mfa_qr(self, user_id: str, username: str) -> str:
+    async def get_mfa_qr(self, user_id: str, username: str) -> str:
         """Generate QR code for MFA setup"""
         if user_id not in self.mfa_secrets:
             raise ValueError("MFA not set up for this user")

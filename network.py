@@ -12,8 +12,8 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import defaultdict
 from blockchain import Blockchain, Block, Transaction
 from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth
-from prometheus_client import Counter, Gauge
-from utils import SecurityUtils
+from prometheus_client import Counter, Gauge, REGISTRY
+from utils import SecurityUtils, safe_gauge, safe_counter
 from security import SecurityMonitor
 from security.mfa import MFAManager
 import json
@@ -25,9 +25,9 @@ from blockchain import Blockchain, Block, Transaction
 logger = logging.getLogger("BlockchainNetwork")
 
 # Metrics
-BLOCKS_RECEIVED = Counter('blocks_received_total', 'Total number of blocks received from peers')
-TXS_BROADCAST = Counter('transactions_broadcast_total', 'Total number of transactions broadcast')
-PEER_FAILURES = Counter('peer_failures_total', 'Total number of peer connection failures')
+BLOCKS_RECEIVED = safe_counter('blocks_received_total', 'Total number of blocks received from peers')
+TXS_BROADCAST = safe_counter('transactions_broadcast_total', 'Total number of transactions broadcast')
+PEER_FAILURES = safe_counter('peer_failures_total', 'Total number of peer connection failures')
 
 # Configuration
 CONFIG = {
@@ -129,7 +129,7 @@ class BlockchainNetwork:
         self.bootstrap_nodes = bootstrap_nodes or []
         self.security_monitor = security_monitor
         self.shutdown_flag = False
-        self.loop = None  # Will be set in run()
+        self.loop = None or asyncio.get_event_loop()
         self.private_key, self.public_key = generate_node_keypair()
         self.peers = {}  # Store active peer connections
         self.app = web.Application(middlewares=[rate_limit_middleware])
@@ -140,7 +140,7 @@ class BlockchainNetwork:
         self.peer_failures: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
         self.lock = threading.Lock()  # Add thread lock
-        self.active_requests = Gauge(
+        self.active_requests = safe_gauge(
             f'active_peer_requests_{node_id}',
             'Number of active requests to peers'
             )
@@ -156,6 +156,21 @@ class BlockchainNetwork:
         self.ssl_context = None
         self.client_ssl_context = None
         self.init_ssl()
+
+        # Check if the metric already exists before creating it
+        metric_name = f'active_peer_requests_{node_id}'
+        if metric_name in [m.name for m in REGISTRY._names_to_collectors.values()]:
+            # Get the existing metric instead of creating a new one
+            self.active_requests = next(
+                m for m in REGISTRY._names_to_collectors.values() 
+                if m.name == metric_name
+            )
+        else:
+            # Create a new metric
+            self.active_requests = Gauge(
+                metric_name,
+                'Number of active requests to peers'
+            )
 
     def init_ssl(self):
         """Initialize SSL contexts"""
@@ -209,10 +224,8 @@ class BlockchainNetwork:
     async def start(self):
         """Start the network and security monitoring"""
         if self.security_monitor:
-            # Start security monitoring in the correct event loop
+        # Start security monitoring in the correct event loop
             asyncio.create_task(self.security_monitor.analyze_patterns())
-        
-        # ... rest of start-up code ...
 
     def run(self):
         logger.info(f"Starting network server on {self.host}:{self.port}")
@@ -520,7 +533,7 @@ class BlockchainNetwork:
     async def request_chain(self) -> None:
         """Request and potentially update the blockchain from peers."""
         best_chain = self.blockchain.chain
-        best_difficulty = self.blockchain.get_total_difficulty()
+        best_difficulty = await self.blockchain.get_total_difficulty()
         with self.lock:
             tasks = []
             for peer_id, (host, port, _) in self.peers.items():
@@ -549,7 +562,7 @@ class BlockchainNetwork:
         """Perform a full sync and discovery cycle."""
         try:
             logger.debug("Starting sync and discovery cycle")
-            self.blockchain.adjust_difficulty()
+            await self.blockchain.adjust_difficulty()
             await self.discover_peers()
             await self.request_chain()
             await self.broadcast_peer_announcement()
@@ -714,13 +727,29 @@ class BlockchainNetwork:
 
             # Start health check server
             await self.start_health_server()
-
-            async with self.server:
-                await self.server.serve_forever()
+            
+            # Start serving in the background without awaiting
+            asyncio.create_task(self.server_task())
+            
+            # Start periodic sync task
+            await self.start_periodic_sync()
+            
+            # Return without blocking
+            return self.server
 
         except Exception as e:
             logger.error(f"Failed to start servers: {e}")
             raise
+
+    async def server_task(self):
+        """Run the server in a background task"""
+        try:
+            async with self.server:
+                await self.server.serve_forever()
+        except asyncio.CancelledError:
+            logger.info("Server task cancelled")
+        except Exception as e:
+            logger.error(f"Server error: {e}")
 
     async def handle_message(self, message: str, client_ip: str):
         """Handle incoming messages"""
@@ -773,10 +802,6 @@ class BlockchainNetwork:
             logger.error(f"Error during network cleanup: {e}")
 
     def run(self):
-        """Run the network in its own event loop"""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        
         try:
             self.loop.run_until_complete(self.start_server())
         except Exception as e:

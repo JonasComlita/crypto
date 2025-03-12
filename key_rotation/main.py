@@ -11,7 +11,8 @@ from key_rotation.api import create_rotation_api
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-async def main(node_id: Optional[str] = None, is_validator: bool = False, port: int = 5000, host: str = "127.0.0.1") -> None:
+async def main(node_id: Optional[str] = None, is_validator: bool = False, 
+              port: int = 5000, host: str = "127.0.0.1", loop=None) -> None:
     load_dotenv()
     node_id = node_id or os.getenv("NODE_ID") or str(uuid.uuid4())
     is_validator = is_validator or (os.getenv("IS_VALIDATOR", "false").lower() == "true")
@@ -20,6 +21,9 @@ async def main(node_id: Optional[str] = None, is_validator: bool = False, port: 
     
     rotation_manager = KeyRotationManager(node_id=node_id, is_validator=is_validator)
     await rotation_manager.start()
+    
+    # Use the provided loop or the current one
+    current_loop = loop or asyncio.get_event_loop()
     
     app = Flask(__name__)
     create_rotation_api(app, rotation_manager)

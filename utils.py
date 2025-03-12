@@ -15,6 +15,7 @@ from key_rotation.core import KeyRotationManager
 import logging
 import time
 import random
+from prometheus_client import REGISTRY, Counter, Gauge
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -203,4 +204,28 @@ def find_available_port(start_port: int = 1024, end_port: int = 65535, host: str
         return port
     except Exception as e:
         logger.error(f"Failed to find available port: {e}")
+        raise
+
+def safe_gauge(name, description, registry=REGISTRY):
+        """Safely get or create a Gauge metric"""
+        try:
+            return Gauge(name, description, registry=registry)
+        except ValueError:
+            # If the metric already exists, return the existing one
+            for metric in registry._names_to_collectors.values():
+                if metric.name == name:
+                    return metric
+            # If we get here, the error was for a different reason
+            raise
+
+def safe_counter(name, description, registry=REGISTRY):
+    """Safely get or create a Counter metric"""
+    try:
+        return Counter(name, description, registry=registry)
+    except ValueError:
+        # If the metric already exists, return the existing one
+        for metric in registry._names_to_collectors.values():
+            if metric.name == name:
+                return metric
+        # If we get here, the error was for a different reason
         raise
