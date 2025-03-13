@@ -15,7 +15,7 @@ from key_rotation.core import KeyRotationManager
 import logging
 import time
 import random
-from prometheus_client import REGISTRY, Counter, Gauge
+from prometheus_client import REGISTRY, Counter, Gauge, CollectorRegistry, GC_COLLECTOR, PLATFORM_COLLECTOR, PROCESS_COLLECTOR
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,22 +24,25 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+# Create a custom registry for our metrics
+BLOCKCHAIN_REGISTRY = CollectorRegistry()
+
 # Global KeyRotationManager instance
 rotation_manager: Optional[KeyRotationManager] = None
 
-def init_rotation_manager(node_id: str) -> None:
+async def init_rotation_manager(node_id: str) -> None:
     """Initialize the KeyRotationManager for the node."""
     global rotation_manager
     start_time = time.time()
     rotation_manager = KeyRotationManager(node_id=node_id)
     logger.info(f"Initialized KeyRotationManager for {node_id} in {(time.time() - start_time):.3f} seconds")
 
-def get_peer_auth_secret() -> str:
+async def get_peer_auth_secret() -> str:
     """Retrieve the current peer authentication secret."""
     if not rotation_manager:
         raise ValueError("Rotation manager not initialized")
     start_time = time.time()
-    secret = rotation_manager.get_current_auth_secret()
+    secret = await rotation_manager.get_current_auth_secret()
     logger.debug(f"Retrieved peer auth secret in {(time.time() - start_time) * 1e6:.2f} µs")
     return secret
 
@@ -206,26 +209,63 @@ def find_available_port(start_port: int = 1024, end_port: int = 65535, host: str
         logger.error(f"Failed to find available port: {e}")
         raise
 
-def safe_gauge(name, description, registry=REGISTRY):
-        """Safely get or create a Gauge metric"""
-        try:
-            return Gauge(name, description, registry=registry)
-        except ValueError:
-            # If the metric already exists, return the existing one
-            for metric in registry._names_to_collectors.values():
-                if metric.name == name:
-                    return metric
-            # If we get here, the error was for a different reason
-            raise
-
-def safe_counter(name, description, registry=REGISTRY):
-    """Safely get or create a Counter metric"""
+async def find_available_port_async(start_port: int = 1024, end_port: int = 65535, host: str = 'localhost') -> int:
+    """Find an available port asynchronously"""
     try:
-        return Counter(name, description, registry=registry)
-    except ValueError:
-        # If the metric already exists, return the existing one
-        for metric in registry._names_to_collectors.values():
-            if metric.name == name:
-                return metric
-        # If we get here, the error was for a different reason
+        port = random.randint(start_port, end_port)
+        attempts = 0
+        max_attempts = 100
+
+        while attempts < max_attempts:
+            try:
+                # Test if port is available
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind((host, port))
+                sock.close()
+                logger.info(f"Found available port: {port}")
+                return port
+            except OSError:
+                attempts += 1
+                port = random.randint(start_port, end_port)
+                
+        raise RuntimeError(f"No available ports found between {start_port} and {end_port}")
+    except Exception as e:
+        logger.error(f"Error finding available port: {e}")
         raise
+
+def safe_gauge(name: str, description: str, registry=BLOCKCHAIN_REGISTRY) -> Gauge:
+    """Safely create or get a Gauge metric with labels"""
+    try:
+        return Gauge(name, description, labelnames=['instance'], registry=registry)
+    except ValueError:
+        # If metric already exists, get it from registry
+        for collector in registry._names_to_collectors.values():
+            if hasattr(collector, 'name') and collector.name == name:
+                return collector
+        raise  # Re-raise if we can't find it
+
+def safe_counter(name: str, description: str, registry=BLOCKCHAIN_REGISTRY) -> Counter:
+    """Safely create or get a Counter metric with labels"""
+    try:
+        return Counter(name, description, labelnames=['instance'], registry=registry)
+    except ValueError:
+        # If metric already exists, get it from registry
+        for collector in registry._names_to_collectors.values():
+            if hasattr(collector, 'name') and collector.name == name:
+                return collector
+        raise  # Re-raise if we can't find it
+# Disable automatic collector registration
+for collector in [GC_COLLECTOR, PLATFORM_COLLECTOR, PROCESS_COLLECTOR]:
+    try:
+        REGISTRY.unregister(collector)
+    except KeyError:
+        pass  # Collector might not be registered
+
+# Define metrics with consistent names
+BLOCKS_RECEIVED = safe_counter('blocks_received_total', 'Total number of blocks received from peers')
+TXS_BROADCAST = safe_counter('transactions_broadcast_total', 'Total number of transactions broadcast')
+PEER_FAILURES = safe_counter('peer_failures_total', 'Total number of peer connection failures')
+BLOCKS_MINED = safe_counter('blocks_mined_total', 'Total number of blocks mined')
+PEER_COUNT = safe_gauge('peer_count', 'Number of connected peers')
+BLOCK_HEIGHT = safe_gauge('blockchain_height', 'Current height of the blockchain')
+ACTIVE_REQUESTS = safe_gauge('active_peer_requests', 'Number of active requests to peers')

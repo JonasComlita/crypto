@@ -1,8 +1,5 @@
 import sys
 import os
-print("core.py sys.path:", sys.path)
-print("core.py current directory:", os.getcwd())
-
 import asyncio
 import base64
 import hashlib

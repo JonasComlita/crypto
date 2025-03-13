@@ -902,6 +902,7 @@ class BlockchainGUI:
                     # Signal event loop to stop
                     self.shutdown_event.set()
                     self.loop.stop()
+                    self.is_running = False
             
             # Run cleanup in event loop and wait for it to complete
             future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)

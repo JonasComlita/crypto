@@ -11,9 +11,8 @@ import random
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from collections import defaultdict
 from blockchain import Blockchain, Block, Transaction
-from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth
-from prometheus_client import Counter, Gauge, REGISTRY
-from utils import SecurityUtils, safe_gauge, safe_counter
+from utils import PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH, generate_node_keypair, validate_peer_auth, SecurityUtils
+from utils import BLOCKS_RECEIVED, TXS_BROADCAST, PEER_FAILURES, BLOCKS_MINED, BLOCK_HEIGHT, PEER_COUNT, ACTIVE_REQUESTS, safe_gauge, safe_counter
 from security import SecurityMonitor
 from security.mfa import MFAManager
 import json
@@ -23,11 +22,7 @@ from blockchain import Blockchain, Block, Transaction
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
-
-# Metrics
-BLOCKS_RECEIVED = safe_counter('blocks_received_total', 'Total number of blocks received from peers')
-TXS_BROADCAST = safe_counter('transactions_broadcast_total', 'Total number of transactions broadcast')
-PEER_FAILURES = safe_counter('peer_failures_total', 'Total number of peer connection failures')
+logging.basicConfig(level=logging.DEBUG)
 
 # Configuration
 CONFIG = {
@@ -131,7 +126,7 @@ class BlockchainNetwork:
         self.shutdown_flag = False
         self.loop = None or asyncio.get_event_loop()
         self.private_key, self.public_key = generate_node_keypair()
-        self.peers = {}  # Store active peer connections
+        self.peers = {}
         self.app = web.Application(middlewares=[rate_limit_middleware])
         self.setup_routes()
         self.sync_task: Optional[asyncio.Task] = None
@@ -139,11 +134,9 @@ class BlockchainNetwork:
         self.last_announcement = 0
         self.peer_failures: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
-        self.lock = threading.Lock()  # Add thread lock
-        self.active_requests = safe_gauge(
-            f'active_peer_requests_{node_id}',
-            'Number of active requests to peers'
-            )
+        self.lock = threading.Lock() 
+        self.active_requests = ACTIVE_REQUESTS
+        self.active_requests.labels(instance=self.node_id).set(0)
         self.peer_reputation = PeerReputation()
         self.rate_limiter = RateLimiter()
         self.nonce_tracker = NonceTracker()
@@ -157,21 +150,6 @@ class BlockchainNetwork:
         self.client_ssl_context = None
         self.init_ssl()
 
-        # Check if the metric already exists before creating it
-        metric_name = f'active_peer_requests_{node_id}'
-        if metric_name in [m.name for m in REGISTRY._names_to_collectors.values()]:
-            # Get the existing metric instead of creating a new one
-            self.active_requests = next(
-                m for m in REGISTRY._names_to_collectors.values() 
-                if m.name == metric_name
-            )
-        else:
-            # Create a new metric
-            self.active_requests = Gauge(
-                metric_name,
-                'Number of active requests to peers'
-            )
-
     def init_ssl(self):
         """Initialize SSL contexts"""
         # Client SSL context
@@ -181,20 +159,43 @@ class BlockchainNetwork:
 
         # Server SSL context
         try:
-            cert_path = f"certs/{self.node_id}.crt"
-            key_path = f"certs/{self.node_id}.key"
+            # Use port-specific certificate paths
+            cert_path = f"certs/{self.node_id}_{self.port}.crt"
+            key_path = f"certs/{self.node_id}_{self.port}.key"
             
-            if os.path.exists(cert_path) and os.path.exists(key_path):
-                self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                self.ssl_context.load_cert_chain(
-                    certfile=cert_path,
-                    keyfile=key_path
+            # Ensure certs directory exists
+            os.makedirs("certs", exist_ok=True)
+            
+            # Debug file existence and paths
+            logger.debug(f"Checking SSL for {self.node_id} on port {self.port}: "
+                        f"cert_path={cert_path}, exists={os.path.exists(cert_path)}, "
+                        f"key_path={key_path}, exists={os.path.exists(key_path)}")
+            
+            # Generate self-signed certificate if files are missing
+            if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+                logger.info(f"SSL certificates not found for {self.node_id} on port {self.port}. Generating self-signed certificates...")
+                cmd = (
+                    f'openssl req -x509 -newkey rsa:2048 -keyout "{key_path}" '
+                    f'-out "{cert_path}" -days 365 -nodes -subj "/CN={self.node_id}"'
                 )
+                result = os.system(cmd)
+                if result != 0:
+                    raise RuntimeError(f"Failed to generate SSL certificates for {self.node_id} on port {self.port} with OpenSSL")
+                logger.info(f"Generated self-signed certificates: {cert_path}, {key_path}")
             else:
-                logger.info("Running without HTTPS; cert or key not provided")
-                self.ssl_context = None
+                logger.debug(f"Using existing SSL certificates for {self.node_id} on port {self.port}")
+            
+            # Load the certificates
+            self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self.ssl_context.load_cert_chain(
+                certfile=cert_path,
+                keyfile=key_path
+            )
+            logger.info(f"HTTPS enabled with certificates for {self.node_id} on port {self.port}")
+            
         except Exception as e:
-            logger.warning(f"Failed to load SSL certificates: {e}")
+            logger.error(f"Failed to initialize SSL for {self.node_id} on port {self.port}: {e}", exc_info=True)
+            logger.warning(f"Running without HTTPS for {self.node_id} on port {self.port} due to SSL failure")
             self.ssl_context = None
 
     def setup_routes(self):
@@ -223,9 +224,19 @@ class BlockchainNetwork:
 
     async def start(self):
         """Start the network and security monitoring"""
+        # Initialize KeyRotationManager if not already done
+        from utils import init_rotation_manager, rotation_manager
+        if not rotation_manager:
+            await init_rotation_manager(self.node_id)
+            logger.info(f"Initialized KeyRotationManager for node {self.node_id} in network start")
+
+        # Start security monitoring if available
         if self.security_monitor:
-        # Start security monitoring in the correct event loop
             asyncio.create_task(self.security_monitor.analyze_patterns())
+
+        # Start the server and sync tasks
+        await self.start_server()
+        logger.info("Network service started")
 
     def run(self):
         logger.info(f"Starting network server on {self.host}:{self.port}")
@@ -250,8 +261,11 @@ class BlockchainNetwork:
     async def send_with_retry(self, url: str, data: dict, method: str = "post", 
                             max_retries: int = CONFIG["max_retries"]) -> Tuple[bool, Optional[dict]]:
         """Send HTTP request with retry logic."""
-        headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET()}"}
-        async with self.active_requests.track_inprogress():
+        # Get auth secret asynchronously
+        auth_secret = await PEER_AUTH_SECRET()
+        headers = {"Authorization": f"Bearer {auth_secret}"}
+        
+        with ACTIVE_REQUESTS.labels(instance=self.node_id).track_inprogress():
             for attempt in range(max_retries):
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -281,7 +295,7 @@ class BlockchainNetwork:
                 if isinstance(result, Exception):
                     logger.warning(f"Failed to broadcast block {block.index} to {peer_id}: {result}")
                     self._increment_failure(peer_id)
-            BLOCKS_RECEIVED.inc()
+            BLOCKS_RECEIVED.labels(instance=self.node_id).inc()
 
     async def send_block(self, peer_id: str, host: str, port: int, block: Block) -> None:
         """Send a block to a specific peer."""
@@ -321,7 +335,7 @@ class BlockchainNetwork:
                 if isinstance(result, Exception):
                     logger.warning(f"Failed to broadcast transaction {transaction.tx_id[:8]} to {peer_id}: {result}")
                     self._increment_failure(peer_id)
-            TXS_BROADCAST.inc()
+            TXS_BROADCAST.labels(instance=self.node_id).inc()
 
     async def send_transaction(self, peer_id: str, host: str, port: int, tx: Transaction) -> None:
         """Send a transaction to a specific peer."""
@@ -522,7 +536,7 @@ class BlockchainNetwork:
     def _increment_failure(self, peer_id: str) -> None:
         """Track peer failures and remove unresponsive peers."""
         self.peer_failures[peer_id] += 1
-        PEER_FAILURES.inc()
+        PEER_FAILURES.labels(instance=self.node_id).inc()
         if self.peer_failures[peer_id] > 3:
             if peer_id in self.peers:
                 del self.peers[peer_id]
@@ -533,7 +547,7 @@ class BlockchainNetwork:
     async def request_chain(self) -> None:
         """Request and potentially update the blockchain from peers."""
         best_chain = self.blockchain.chain
-        best_difficulty = await self.blockchain.get_total_difficulty()
+        best_difficulty = self.blockchain.get_total_difficulty()
         with self.lock:
             tasks = []
             for peer_id, (host, port, _) in self.peers.items():
@@ -562,7 +576,7 @@ class BlockchainNetwork:
         """Perform a full sync and discovery cycle."""
         try:
             logger.debug("Starting sync and discovery cycle")
-            await self.blockchain.adjust_difficulty()
+            self.blockchain.difficulty = self.blockchain.adjust_difficulty()
             await self.discover_peers()
             await self.request_chain()
             await self.broadcast_peer_announcement()
@@ -786,10 +800,14 @@ class BlockchainNetwork:
             if self.runner:
                 await self.runner.cleanup()
             
-            # Close all peer connections
+            # Close all peer connections - make sure peer.close() is async
             for peer in list(self.peers.values()):
                 try:
-                    await peer.close()
+                    if hasattr(peer, 'close') and callable(peer.close):
+                        if asyncio.iscoroutinefunction(peer.close):
+                            await peer.close()
+                        else:
+                            peer.close()
                 except Exception as e:
                     logger.warning(f"Error closing peer connection: {e}")
             

@@ -7,17 +7,13 @@ import sys
 import os
 from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
-from utils import find_available_port, init_rotation_manager
+from utils import find_available_port, init_rotation_manager, find_available_port_async
 from gui import BlockchainGUI
 import threading
 import aiohttp
 from threading import Lock
 from security import SecurityMonitor, MFAManager, KeyBackupManager
 from key_rotation.core import KeyRotationManager
-
-# Debug prints
-print("Main.py sys.path:", sys.path)
-print("Main.py current directory:", os.getcwd())
 
 # Add the project root directory to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -245,138 +241,97 @@ def run_async_loop(loop):
         loop.close()
 
 async def async_main(args, loop):
-    """Main async initialization sequence"""
     try:
-        port = args.port if args.port else find_available_port()
+        port = args.port if args.port else await find_available_port_async()
         api_port = port + 1000
         node_id = f"node{port}"
         logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
         
-        # Initialize security components
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
-        
-        # Initialize key rotation
-        init_rotation_manager(node_id)
-        rotation_manager = KeyRotationManager(
-            node_id=node_id, 
-            is_validator=args.validator,
-            backup_manager=backup_manager if 'backup_manager' in locals() else None
-        )
-        
-        # Initialize blockchain with genesis block
+        await init_rotation_manager(node_id)
+        rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator, backup_manager=backup_manager)
         blockchain = await create_genesis_blockchain(node_id)
         
-        # Parse bootstrap nodes
         bootstrap_nodes = []
         if args.bootstrap:
             bootstrap_nodes = [(node.split(":")[0], int(node.split(":")[1])) for node in args.bootstrap.split(",")]
-        elif port != 5000:
-            bootstrap_nodes = [("127.0.0.1", 5000)]
         
-        # Initialize network with security monitor
-        network = BlockchainNetwork(
-            blockchain, node_id, "127.0.0.1", port, bootstrap_nodes,
-            security_monitor=security_monitor
-        )
-        network.loop = loop  # Assign shared loop
-        
-        # Start network server
+        network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, bootstrap_nodes, security_monitor=security_monitor)
+        network.loop = loop
         await network.start_server()
         
-        # Start key rotation manager
         await rotation_manager.start()
-        
-        # Start key rotation API in a separate thread
         from key_rotation.main import main as rotation_main
-        rotation_thread = threading.Thread(
-            target=lambda: asyncio.run_coroutine_threadsafe(
-                key_rotation.main(node_id, args.validator, api_port, "127.0.0.1", loop),
-                loop
-            ),
-            daemon=True
-        )
-        rotation_thread.start()
+        shutdown_event = asyncio.Event()
+        asyncio.create_task(rotation_main(node_id, args.validator, api_port, "127.0.0.1", loop, shutdown_event))
         
-        # Return all initialized components
-        return blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager
-    
+        return blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event
     except Exception as e:
-        logger.error(f"Error in async initialization: {e}")
+        logger.error(f"Error in async initialization: {e}", exc_info=True)
         raise
 
+def shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event=None):
+    logger.info("Initiating graceful shutdown...")
+    try:
+        network.shutdown_flag = True
+        asyncio.run_coroutine_threadsafe(
+            shutdown_async(gui, blockchain, network, rotation_manager),
+            loop
+        ).result(timeout=10)
+        gui.exit()
+        if shutdown_event:
+            loop.call_soon_threadsafe(shutdown_event.set)  # Signal key rotation to stop
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        loop.call_soon_threadsafe(loop.stop)
+        logger.info("Shutdown completed successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}", exc_info=True)
+        sys.exit(1)
+
 def main():
-    # Add resource limits before any other initialization
     set_resource_limits()
-    
     parser = argparse.ArgumentParser(description="Run a blockchain node.")
     parser.add_argument("--port", type=int, default=None, help="Port to run the node on (1024-65535)")
-    parser.add_argument("--bootstrap", type=str, default=None, 
-                       help="Comma-separated list of bootstrap nodes (host:port)")
-    parser.add_argument("--validator", action="store_true", 
-                       help="Run as validator node for key rotation")
+    parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
+    parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")
     args = parser.parse_args()
 
     if args.port and not validate_port(args.port):
         logger.error("Invalid port number")
         sys.exit(1)
-
     if args.bootstrap and not validate_bootstrap_nodes(args.bootstrap):
         logger.error("Invalid bootstrap nodes format")
         sys.exit(1)
 
-    # Create event loop for async operations
     loop = asyncio.new_event_loop()
-    
-    # Start async loop in a separate thread
     async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
     async_thread.start()
     
     try:
-        # Run async initialization and wait for it to complete
         init_future = asyncio.run_coroutine_threadsafe(async_main(args, loop), loop)
-        blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager = init_future.result(timeout=30)
+        blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event = init_future.result(timeout=30)
         
-        # Create GUI with security components
-        gui = BlockchainGUI(
-            blockchain,
-            network,
-            mfa_manager=mfa_manager,
-            backup_manager=backup_manager
-        )
-        
-        # Assign shared event loop to GUI
+        gui = BlockchainGUI(blockchain, network, mfa_manager=mfa_manager, backup_manager=backup_manager)
         gui.loop = loop
         
-        # Set up signal handlers for clean shutdown
         def signal_handler(sig, frame):
-            shutdown(gui, blockchain, network, rotation_manager, loop)
+            logger.info(f"Received signal {sig}, initiating shutdown")
+            shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event)
             sys.exit(0)
-            
+        
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        # Run GUI in main thread (this blocks until GUI is closed)
         gui.run()
-        
     except Exception as e:
-        logger.error(f"Error in main: {e}")
+        logger.error(f"Error in main: {e}", exc_info=True)
     finally:
-        # Ensure clean shutdown if we reach here
         logger.info("Main thread exiting, cleaning up...")
-        
-        try:
-            # Stop the async loop
-            loop.call_soon_threadsafe(loop.stop)
-            
-            # Wait for async thread to finish
-            async_thread.join(timeout=5)
-            
-            # Force cleanup if thread doesn't exit
-            if async_thread.is_alive():
-                logger.warning("Async thread didn't exit cleanly")
-                
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
+        loop.call_soon_threadsafe(loop.stop)
+        async_thread.join(timeout=5)
+        if async_thread.is_alive():
+            logger.warning("Event loop thread did not terminate cleanly")
 
 if __name__ == "__main__":
     main()
