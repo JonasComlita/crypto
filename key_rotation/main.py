@@ -9,7 +9,6 @@ from typing import Optional
 from key_rotation.core import KeyRotationManager
 from key_rotation.api import create_rotation_api
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 async def main(node_id: Optional[str] = None, is_validator: bool = False, 

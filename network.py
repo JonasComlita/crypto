@@ -246,14 +246,22 @@ class BlockchainNetwork:
     async def stop(self):
         """Stop the network and cancel background tasks."""
         logger.info("Stopping network...")
+        tasks_to_cancel = []
+        
         if self.sync_task and not self.sync_task.done():
-            self.sync_task.cancel()
+            tasks_to_cancel.append(self.sync_task)
         if self.discovery_task and not self.discovery_task.done():
-            self.discovery_task.cancel()
-        try:
-            await asyncio.gather(self.sync_task, self.discovery_task, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
+            tasks_to_cancel.append(self.discovery_task)
+        
+        for task in tasks_to_cancel:
+            task.cancel()
+        
+        if tasks_to_cancel:
+            try:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+        
         if hasattr(self, 'runner'):
             await self.runner.cleanup()
         logger.info("Network stopped")
@@ -503,8 +511,7 @@ class BlockchainNetwork:
                         logger.debug(f"Skipping unresponsive bootstrap node {peer_id}")
 
             # Discover from existing peers
-            if not self.peers:
-                logger.info("No peers available for discovery")
+            if not self.bootstrap_nodes and not self.peers:
                 return
             peer_id, (host, port, _) = random.choice(list(self.peers.items()))
             url = f"https://{host}:{port}/get_peers"
@@ -595,23 +602,27 @@ class BlockchainNetwork:
 
     async def start_periodic_sync(self) -> asyncio.Task:
         """Start periodic sync and discovery tasks."""
+        if self.shutdown_flag:
+            return
+        
         async def sync_loop():
-            try:
-                logger.info("Starting periodic sync loop")
-                await self.discover_peers()
-                if not self.discovery_task or self.discovery_task.done():
-                    self.discovery_task = self.loop.create_task(self.periodic_discovery())
-                    self.discovery_task.add_done_callback(self._handle_task_result)
-                while True:
-                    await self.sync_and_discover()
+            logger.info("Starting periodic sync loop")
+            last_logged_state = None
+            while not self.shutdown_flag:
+                try:
+                    await self.discover_peers()
+                    current_state = "No peers" if not self.peers and not self.bootstrap_nodes else "Peers present"
+                    if current_state != last_logged_state:
+                        logger.info(current_state if current_state == "No peers" else "Peer sync completed")
+                        last_logged_state = current_state
                     await asyncio.sleep(CONFIG["sync_interval"])
-            except asyncio.CancelledError:
-                logger.info("Sync loop cancelled")
-                if self.discovery_task and not self.discovery_task.done():
-                    self.discovery_task.cancel()
-            except Exception as e:
-                logger.critical(f"Sync loop failed: {e}")
-                raise
+                except Exception as e:
+                    logger.critical(f"Sync loop failed: {e}", exc_info=True)
+                    raise
+                finally:
+                    await asyncio.sleep(0.1)
+        
+        asyncio.create_task(sync_loop())
 
         if self.sync_task and not self.sync_task.done():
             logger.warning("Sync task already running")

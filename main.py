@@ -9,7 +9,8 @@ import time
 import concurrent.futures
 from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
-from utils import find_available_port, init_rotation_manager, find_available_port_async
+import getpass
+from utils import find_available_port, init_rotation_manager, find_available_port_async, get_secure_password
 from gui import BlockchainGUI
 import threading
 import aiohttp
@@ -57,145 +58,6 @@ async def health_check(host: str, port: int, client_ssl_context, retries: int = 
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return False
-
-async def shutdown_async(gui, blockchain, network, rotation_manager, shutdown_event=None):
-    """Asynchronous shutdown sequence, runs in the event loop"""
-    logger.info("Initiating graceful async shutdown...")
-    try:
-        # Stop mining if active
-        if hasattr(blockchain, 'miner') and blockchain.miner.mining:
-            await blockchain.stop_mining()
-            logger.info("Mining stopped during shutdown")
-        
-        # Stop network operations
-        if network:
-            await network.stop()
-            logger.info("Network stopped")
-        
-        # Stop blockchain
-        if blockchain and hasattr(blockchain, 'shutdown'):
-            await blockchain.shutdown()
-            logger.info("Blockchain shutdown completed")
-        
-        # Stop rotation manager
-        if rotation_manager and hasattr(rotation_manager, 'stop'):
-            await rotation_manager.stop()
-            logger.info("Key rotation manager stopped")
-        
-        # Clean up security monitoring
-        if network.security_monitor and hasattr(network.security_monitor, 'cleanup'):
-            await network.security_monitor.cleanup()
-            logger.info("Security monitor cleaned up")
-            
-        # Set shutdown event if provided
-        if shutdown_event:
-            shutdown_event.set()
-            
-        logger.info("Async shutdown completed successfully")
-    except Exception as e:
-        logger.error(f"Error during async shutdown: {e}", exc_info=True)
-
-def graceful_shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event=None):
-    """Improved graceful shutdown function that prevents race conditions"""
-    global shutdown_in_progress
-    
-    # Prevent multiple shutdown attempts
-    if shutdown_in_progress:
-        logger.info("Shutdown already in progress, skipping")
-        return
-        
-    shutdown_in_progress = True
-    logger.info("Initiating graceful shutdown...")
-    
-    try:
-        # Set shutdown flag on network
-        if network and hasattr(network, 'shutdown_flag'):
-            network.shutdown_flag = True
-        
-        # Create a flag to track GUI shutdown
-        gui_shutdown_complete = Event()
-        
-        # Ensure the GUI is notified to begin shutdown
-        try:
-            # Assuming gui.exit() will eventually trigger gui.root.destroy()
-            # Modify gui.exit() to set this event when complete
-            old_exit = getattr(gui, 'exit', None)
-            
-            def new_exit():
-                if old_exit:
-                    old_exit()
-                gui_shutdown_complete.set()
-                
-            gui.exit = new_exit
-            
-            # Start GUI shutdown
-            if threading.current_thread() is not threading.main_thread():
-                gui.root.after(0, gui.root.quit)
-            else:
-                gui.root.quit()
-                
-        except Exception as e:
-            logger.error(f"Error initiating GUI shutdown: {e}")
-            # Continue with other shutdown steps
-        
-        try:
-            # Run async shutdown
-            future = asyncio.run_coroutine_threadsafe(
-                shutdown_async(gui, blockchain, network, rotation_manager, shutdown_event),
-                loop
-            )
-            # Wait for async shutdown with timeout
-            future.result(timeout=8)
-        except concurrent.futures.TimeoutError:
-            logger.warning("Async shutdown timed out")
-        except Exception as e:
-            logger.error(f"Error running async shutdown: {e}")
-        
-        # Wait for GUI to finish closing (with timeout)
-        gui_shutdown_complete.wait(timeout=3)
-        
-        # Safe cleanup of the loop
-        if not loop.is_closed():
-            try:
-                # Cancel remaining tasks
-                remaining_tasks = [t for t in asyncio.all_tasks(loop) 
-                                  if t is not asyncio.current_task()]
-                
-                if remaining_tasks:
-                    logger.info(f"Cancelling {len(remaining_tasks)} remaining tasks")
-                    for task in remaining_tasks:
-                        task.cancel()
-                
-                # Use a safe approach to stop the loop
-                try:
-                    loop.call_soon_threadsafe(loop.stop)
-                except RuntimeError:
-                    # Loop might already be closed
-                    pass
-                    
-            except Exception as e:
-                logger.error(f"Error cleaning up loop: {e}")
-        
-        logger.info("Shutdown procedures completed")
-        
-    except Exception as e:
-        logger.error(f"Critical error during shutdown: {e}", exc_info=True)
-        sys.exit(1)
-
-def add_exit_method_to_gui(gui):
-    """Add or enhance the exit method on the GUI"""
-    if not hasattr(gui, 'exit'):
-        def exit_method():
-            try:
-                gui.root.quit()
-                gui.root.update()  # Process any pending events
-                gui.root.destroy()
-            except Exception as e:
-                logger.error(f"Error in GUI exit: {e}")
-        
-        gui.exit = exit_method
-        logger.info("Added exit method to GUI")
-
 
 async def run_async_tasks(blockchain: Blockchain, network: BlockchainNetwork, rotation_manager, loop: asyncio.AbstractEventLoop):
     """Run initial async tasks."""
@@ -272,10 +134,34 @@ async def initialize_security(node_id: str) -> tuple:
     
     return security_monitor, mfa_manager, backup_manager
 
-async def create_genesis_blockchain(node_id: str) -> Blockchain:
+def get_wallet_password(args):
+    """Get wallet password based on command line arguments"""
+    # Check for explicit password
+    if args.password:
+        return args.password
+    
+    # Check for environment variable
+    if args.password_env:
+        password = os.environ.get("WALLET_PASSWORD")
+        if password:
+            return password
+        else:
+            logger.warning("WALLET_PASSWORD environment variable requested but not set")
+    
+    # Interactive prompt
+    if args.prompt_password:
+        try:
+            return getpass.getpass("Enter wallet encryption password: ")
+        except Exception as e:
+            logger.error(f"Failed to get password from prompt: {e}")
+    
+    # Return None if no password was provided - KeyManager will use default
+    return None
+
+async def create_genesis_blockchain(node_id: str, wallet_password: str) -> Blockchain:
     """Initialize blockchain with genesis block"""
     # Create blockchain instance
-    blockchain = Blockchain(node_id=node_id)
+    blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password)
     
     # Initialize it
     await blockchain.initialize()
@@ -328,7 +214,7 @@ def run_async_loop(loop):
                     task.cancel()
                 
                 # Run the loop briefly to process cancellations
-                loop.run_until_complete(asyncio.sleep(0.1))
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 loop.close()
         except Exception as e:
             logger.error(f"Error closing loop: {e}")
@@ -341,10 +227,13 @@ async def async_main(args, loop):
         node_id = f"node{port}"
         logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
         
+        wallet_password = get_wallet_password(args)
+
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
         await init_rotation_manager(node_id)
         rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator, backup_manager=backup_manager)
-        blockchain = await create_genesis_blockchain(node_id)
+
+        blockchain = await create_genesis_blockchain(node_id, wallet_password)
         
         bootstrap_nodes = []
         if args.bootstrap:
@@ -364,54 +253,20 @@ async def async_main(args, loop):
         logger.error(f"Error in async initialization: {e}", exc_info=True)
         raise
 
-def run_async_loop(loop):
-    """Run the asyncio event loop in a separate thread"""
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_forever()
-    except Exception as e:
-        logger.error(f"Async loop crashed: {e}")
-    finally:
-        logger.info("Async loop stopped")
-        try:
-            # Ensure all tasks are properly cancelled and loop is closed
-            if not loop.is_closed():
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                
-                # Run the loop briefly to process cancellations
-                loop.run_until_complete(asyncio.sleep(0.1))
-                loop.close()
-        except Exception as e:
-            logger.error(f"Error closing loop: {e}")
-
-
-def shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event=None):
-    logger.info("Initiating graceful shutdown...")
-    try:
-        network.shutdown_flag = True
-        asyncio.run_coroutine_threadsafe(
-            shutdown_async(gui, blockchain, network, rotation_manager),
-            loop
-        ).result(timeout=10)
-        gui.exit()
-        if shutdown_event:
-            loop.call_soon_threadsafe(shutdown_event.set)  # Signal key rotation to stop
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
-        loop.call_soon_threadsafe(loop.stop)
-        logger.info("Shutdown completed successfully")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}", exc_info=True)
-        sys.exit(1)
-
 def main():
     set_resource_limits()
     parser = argparse.ArgumentParser(description="Run a blockchain node.")
     parser.add_argument("--port", type=int, default=None, help="Port to run the node on (1024-65535)")
     parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
     parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")
+    
+    # Add wallet password arguments
+    parser.add_argument("--password", type=str, help="Wallet encryption password")
+    parser.add_argument("--password-env", action="store_true", 
+                       help="Get password from WALLET_PASSWORD environment variable")
+    parser.add_argument("--prompt-password", action="store_true",
+                       help="Prompt for wallet password at startup")
+    
     args = parser.parse_args()
 
     if args.port and not validate_port(args.port):
@@ -443,59 +298,45 @@ def main():
         gui = BlockchainGUI(blockchain, network, mfa_manager=mfa_manager, backup_manager=backup_manager)
         gui.loop = loop
         
-        # Add an exit method if needed
-        add_exit_method_to_gui(gui)
-        
-        # Configure signal handlers for graceful shutdown
-        def signal_handler(sig, frame):
-            logger.info(f"Received signal {sig}, initiating shutdown")
-            graceful_shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event)
-            # Exit with a small delay to allow logging to complete
-            time.sleep(0.5)
-            sys.exit(0)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Override the GUI's on_closing method to use our graceful shutdown
-        original_on_closing = gui.on_closing
-        def new_on_closing():
-            logger.info("Window close requested, initiating shutdown")
-            try:
-                graceful_shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event)
-                # Don't call the original as it might cause issues
-            except Exception as e:
-                logger.error(f"Error in custom on_closing: {e}")
-                # Try the original as a fallback
-                try:
-                    original_on_closing()
-                except:
-                    pass
-        
-        gui.on_closing = new_on_closing
-        gui.root.protocol("WM_DELETE_WINDOW", gui.on_closing)
-        
         # Run the GUI
         gui.run()
-        
+
     except Exception as e:
-        logger.error(f"Error in main: {e}", exc_info=True)
+        logger.error(f"Error in main: {e}", exc_info=True)  
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
     finally:
-        # Final cleanup if we got here without a proper shutdown
-        logger.info("Main thread exiting, final cleanup...")
-        
-        # If we haven't shut down yet, do it now
-        if not shutdown_in_progress and gui and loop and not loop.is_closed():
-            try:
-                graceful_shutdown(gui, blockchain, network, rotation_manager, loop, shutdown_event)
-            except Exception as e:
-                logger.error(f"Error in final shutdown: {e}")
-        
-        # Wait for the async thread to end (with timeout)
-        if 'async_thread' in locals():
-            async_thread.join(timeout=3)
-            if async_thread.is_alive():
-                logger.warning("Event loop thread did not terminate cleanly")
+        try:
+            # Ensure GUI cleanup only happens once
+            if 'gui' in locals() and gui:
+                if not hasattr(gui, '_shutdown_in_progress'):
+                    gui.exit()
+            
+            # Stop the event loop
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(loop.stop)
+            
+            # Wait briefly for async thread
+            if 'async_thread' in locals() and async_thread.is_alive():
+                async_thread.join(timeout=2)
+            
+            # Kill all remaining threads except main thread
+            for thread in threading.enumerate():
+                if thread != threading.current_thread() and not thread.daemon:
+                    try:
+                        thread._stop()
+                    except:
+                        pass
+            
+            logger.info("Clean shutdown completed")
+            
+            # Force exit after brief delay
+            time.sleep(0.5)  # Give logger time to write
+            os._exit(0)  # Force immediate termination
+            
+        except Exception as e:
+            logger.error(f"Error during final cleanup: {e}")
+            os._exit(1)
 
 if __name__ == "__main__":
     try:

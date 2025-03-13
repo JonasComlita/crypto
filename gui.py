@@ -21,7 +21,6 @@ import gc
 import concurrent.futures
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class BlockchainGUI:
@@ -155,6 +154,14 @@ class BlockchainGUI:
             command=self.create_new_wallet
         )
         new_wallet_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        # Change password button
+        change_pass_btn = ttk.Button(
+            select_frame,
+            text="Change Wallet Password",
+            command=self.handle_change_password
+        )
+        change_pass_btn.grid(row=0, column=3, padx=5, pady=5)
         
         # Balance display
         self.balance_label = ttk.Label(
@@ -490,6 +497,10 @@ class BlockchainGUI:
                 values=(block.index, block.timestamp, len(block.transactions), block.hash[:20] + "...")
             )
 
+    def _handle_new_wallet(self):
+        """Handle creating a new wallet"""
+        self.loop.create_task(self._create_new_wallet())
+
     def create_new_wallet(self):
         """Create a new wallet"""
         try:
@@ -560,6 +571,41 @@ class BlockchainGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Error selecting wallet: {str(e)}")
 
+    def prompt_password(self, title: str, message: str) -> str:
+        """Prompt user for a password"""
+        password = simpledialog.askstring(
+            title,
+            message,
+            show='*',
+            parent=self.root
+        )
+        return password
+
+    def handle_change_password(self):
+        """Handle password change button click"""
+        # First verify MFA if enabled
+        if self.mfa_manager and not self.verify_mfa():
+            self.show_error("MFA verification required to change password")
+            return
+
+        # Get the old password
+        old_password = self.prompt_password("Current Password", "Enter current wallet password:")
+        if not old_password:
+            return
+
+        # Get the new password
+        new_password = self.prompt_password("New Password", "Enter new wallet password:")
+        if not new_password:
+            return
+
+        # Confirm the new password
+        confirm_password = self.prompt_password("Confirm Password", "Confirm new wallet password:")
+        if not confirm_password:
+            return
+            
+        # Create task to change password
+        self.loop.create_task(self.change_wallet_password(old_password, new_password))
+
     def verify_mfa(self):
         """Verify MFA code if enabled"""
         if not self.mfa_manager:
@@ -569,7 +615,20 @@ class BlockchainGUI:
         if not code:
             return False
             
-        return self.mfa_manager.verify_code(self.network.node_id, code)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.mfa_manager.verify_mfa(self.network.node_id, code),
+                self.loop
+            )
+            result = future.result(timeout=5)
+            if result:
+                logger.info("MFA verification successful")
+            else:
+                logger.warning("MFA verification failed")
+            return result
+        except Exception as e:
+            logger.error(f"MFA verification error: {e}")
+            return False
 
     async def update_async_balance(self, address):
         """Update the balance display asynchronously"""
@@ -861,9 +920,38 @@ class BlockchainGUI:
         )
         restore_btn.grid(row=0, column=2, padx=5, pady=5)
 
+    # Updated handle_mfa_setup method for BlockchainGUI class
     def handle_mfa_setup(self):
-        """Handle MFA setup button click"""
-        asyncio.run_coroutine_threadsafe(self.setup_mfa(), self.loop)
+        """Handle MFA setup button click with proper async handling"""
+        try:
+            # Create a task for the proper async handling
+            async def do_mfa_setup():
+                try:
+                    if not self.mfa_manager:
+                        return
+                    
+                    # Generate the secret and await the result
+                    secret = await self.mfa_manager.generate_mfa_secret(self.network.node_id)
+                    logger.info(f"Generated MFA secret for {self.network.node_id}")
+                    
+                    # Get the QR code and await the result
+                    qr_code = await self.mfa_manager.get_mfa_qr(
+                        self.network.node_id,
+                        f"OriginalCoin-{self.network.node_id}"
+                    )
+                    logger.info("Generated QR code for MFA setup")
+                    
+                    # Show the QR code in the main thread
+                    self.update_queue.put(lambda: self.show_qr_code(qr_code))
+                except Exception as e:
+                    logger.error(f"MFA setup error: {e}")
+                    self.update_queue.put(lambda: messagebox.showerror("MFA Setup Error", str(e)))
+            
+            # Run the async task in the event loop
+            asyncio.run_coroutine_threadsafe(do_mfa_setup(), self.loop)
+        except Exception as e:
+            logger.error(f"Error starting MFA setup: {e}")
+            self.show_error(f"Failed to start MFA setup: {e}")
 
     def handle_backup_keys(self):
         """Handle backup keys button click"""
@@ -874,87 +962,52 @@ class BlockchainGUI:
         asyncio.run_coroutine_threadsafe(self.restore_keys(), self.loop)
 
     def on_closing(self):
-        """Improved application shutdown handler for GUI window close events"""
-        logger.info("Starting application shutdown...")
+        """Handle application shutdown on window close"""
+        logger.info("Window close requested, initiating shutdown")
         try:
-            # Display shutdown message
-            self.status_var.set("Shutting down...")
-            
-            # Flag to prevent multiple shutdown attempts
             if hasattr(self, '_shutdown_in_progress') and self._shutdown_in_progress:
-                logger.info("Shutdown already in progress")
+                logger.debug("Shutdown already in progress")
                 return
             self._shutdown_in_progress = True
+            self.status_var.set("Shutting down...")
             
-            # Define cleanup coroutine
             async def cleanup():
                 try:
-                    # Stop mining if active
                     if self.mining:
                         await self.blockchain.stop_mining()
-                        logger.info("Mining stopped during shutdown")
-                        
-                    # Network cleanup
+                        logger.debug("Mining stopped")
                     if self.network:
-                        await self.network.cleanup()
-                        logger.info("Network cleanup completed")
-                        
-                    # Blockchain shutdown
+                        await self.network.stop()  # Single call to stop network
+                        logger.debug("Network stopped")
                     if hasattr(self.blockchain, 'shutdown'):
                         await self.blockchain.shutdown()
-                        logger.info("Blockchain shutdown completed")
+                        logger.debug("Blockchain stopped")
                 except Exception as e:
                     logger.error(f"Cleanup error: {e}")
                 finally:
-                    # Signal event loop to stop
                     self.shutdown_event.set()
-                    
-                    # Only stop the loop if it's still running
-                    try:
-                        if not self.loop.is_closed():
-                            self.loop.stop()
-                    except Exception as e:
-                        logger.error(f"Error stopping loop: {e}")
             
-            # Create a future to track cleanup progress
             cleanup_future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
-            
-            # Schedule GUI exit after a short delay
             self.root.after(500, self._delayed_exit, cleanup_future)
             
         except Exception as e:
-            logger.error(f"Error starting shutdown: {e}")
-            # Force destroy as a last resort
-            try:
-                self.root.destroy()
-            except:
-                pass
+            logger.error(f"Shutdown initiation error: {e}")
+            self.root.destroy()
 
     def _delayed_exit(self, cleanup_future):
-        """Handle delayed GUI exit after cleanup starts"""
+        """Handle delayed GUI exit after cleanup"""
         try:
-            # Check if cleanup is done or wait a short time
-            try:
-                cleanup_future.result(timeout=3)
-                logger.info("Async cleanup completed successfully")
-            except concurrent.futures.TimeoutError:
-                logger.warning("Async cleanup timed out, proceeding with GUI exit")
-            except Exception as e:
-                logger.error(f"Error in async cleanup: {e}")
-            
-            # Destroy the GUI
+            cleanup_future.result(timeout=3)
+            logger.info("Shutdown completed")
+        except concurrent.futures.TimeoutError:
+            logger.warning("Shutdown timed out")
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
+        finally:
+            if not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(self.loop.stop)
             self.root.quit()
             self.root.destroy()
-            logger.info("GUI destroyed")
-            
-        except Exception as e:
-            logger.error(f"Error during GUI exit: {e}")
-            # Force exit as a last resort
-            try:
-                import os
-                os._exit(1)
-            except:
-                pass
 
     def exit(self):
         """Add an explicit exit method for external shutdown calls"""

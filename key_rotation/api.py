@@ -5,7 +5,6 @@ import logging
 from typing import Callable, Dict, Any
 from key_rotation.core import KeyRotationManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 def create_rotation_api(app: Flask, rotation_manager: 'KeyRotationManager') -> None:

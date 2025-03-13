@@ -18,7 +18,6 @@ import random
 from prometheus_client import REGISTRY, Counter, Gauge, CollectorRegistry, GC_COLLECTOR, PLATFORM_COLLECTOR, PROCESS_COLLECTOR
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -269,3 +268,35 @@ BLOCKS_MINED = safe_counter('blocks_mined_total', 'Total number of blocks mined'
 PEER_COUNT = safe_gauge('peer_count', 'Number of connected peers')
 BLOCK_HEIGHT = safe_gauge('blockchain_height', 'Current height of the blockchain')
 ACTIVE_REQUESTS = safe_gauge('active_peer_requests', 'Number of active requests to peers')
+
+def get_secure_password(provided_password: str = None) -> str:
+    """
+    Get a secure password for wallet encryption
+    Prioritizes: provided password > environment variable > user input > default
+    """
+    if provided_password:
+        return provided_password
+        
+    # Try environment variable
+    env_password = os.environ.get("WALLET_PASSWORD")
+    if env_password:
+        return env_password
+    
+    # Only try to get user input if running interactively
+    try:
+        import getpass
+        if os.isatty(0):  # Check if running in interactive terminal
+            try:
+                user_password = getpass.getpass("Enter wallet encryption password: ")
+                if user_password:
+                    return user_password
+            except Exception:
+                # Fall through to default if getpass fails
+                pass
+    except (ImportError, AttributeError):
+        # getpass not available or no tty
+        pass
+        
+    # Use default with warning
+    logger.warning("Using default encryption password. Consider setting WALLET_PASSWORD environment variable for better security.")
+    return "defaultSecurePassword123"

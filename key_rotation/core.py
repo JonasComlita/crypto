@@ -17,7 +17,6 @@ from cryptography.fernet import Fernet
 from aiohttp import ClientSession, ClientTimeout
 from security import KeyBackupManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 KEY_ROTATION_INTERVAL_DAYS = 30

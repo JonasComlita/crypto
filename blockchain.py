@@ -25,10 +25,22 @@ import psutil
 import tkinter as tk
 from tkinter import ttk
 import multiprocessing
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import sys
+import time
+import json
+import hashlib
+import ecdsa
+import asyncio
+import base64
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-logging.basicConfig(level=logging.DEBUG)
 handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
-logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("Blockchain")
 
 def _do_mining_work( block_data: dict, difficulty: int) -> Optional[dict]:
@@ -975,8 +987,133 @@ class NetworkService:
         except Exception as e:
             logger.error(f"Failed to handle chain request: {e}")
 
+from utils import get_secure_password
+class KeyManager:
+    """Securely manages wallet keys with strong encryption"""
+    def __init__(self, password: str = None):
+        self.password = get_secure_password(password)
+        self.keystore_path = "keys.encrypted"
+        self.salt = None
+        self.load_salt()
+        
+        # Check if password is default and warn
+        if self.password == "defaultSecurePassword123":
+            logger.warning("Using default wallet encryption password. This is not recommended for production.")
+    
+    def load_salt(self):
+        """Load or create salt for key derivation"""
+        salt_path = "key.salt"
+        try:
+            if os.path.exists(salt_path):
+                with open(salt_path, "rb") as f:
+                    self.salt = f.read()
+            else:
+                self.salt = os.urandom(16)
+                with open(salt_path, "wb") as f:
+                    f.write(self.salt)
+        except Exception as e:
+            logger.error(f"Error loading/creating salt: {e}")
+            self.salt = os.urandom(16)
+    
+    def derive_key(self, password: str) -> bytes:
+        """Derive encryption key from password using PBKDF2"""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
+    
+    def encrypt_private_key(self, private_key: str) -> bytes:
+        """Encrypt a private key"""
+        key = self.derive_key(self.password)
+        f = Fernet(key)
+        return f.encrypt(private_key.encode())
+    
+    def decrypt_private_key(self, encrypted_key: bytes) -> str:
+        """Decrypt a private key"""
+        key = self.derive_key(self.password)
+        f = Fernet(key)
+        return f.decrypt(encrypted_key).decode()
+    
+    async def save_keys(self, wallets: dict):
+        """Save encrypted wallet keys to storage"""
+        try:
+            # Create encrypted wallet data
+            encrypted_wallets = {}
+            for address, wallet in wallets.items():
+                encrypted_private_key = self.encrypt_private_key(wallet['private_key'])
+                encrypted_wallets[address] = {
+                    'public_key': wallet['public_key'],
+                    'encrypted_private_key': base64.b64encode(encrypted_private_key).decode()
+                }
+            
+            # Save encrypted data
+            with open(self.keystore_path, "w") as f:
+                json.dump(encrypted_wallets, f)
+            
+            logger.info(f"Saved {len(wallets)} encrypted wallets to {self.keystore_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save encrypted keys: {e}")
+            return False
+    
+    async def load_keys(self) -> dict:
+        """Load and decrypt wallet keys from storage"""
+        try:
+            if not os.path.exists(self.keystore_path):
+                logger.info(f"No existing key store found at {self.keystore_path}")
+                return {}
+            
+            with open(self.keystore_path, "r") as f:
+                encrypted_wallets = json.load(f)
+            
+            # Decrypt wallet data
+            wallets = {}
+            for address, data in encrypted_wallets.items():
+                encrypted_key = base64.b64decode(data['encrypted_private_key'])
+                private_key = self.decrypt_private_key(encrypted_key)
+                wallets[address] = {
+                    'public_key': data['public_key'],
+                    'private_key': private_key
+                }
+            
+            logger.info(f"Loaded {len(wallets)} encrypted wallets from {self.keystore_path}")
+            return wallets
+        except Exception as e:
+            logger.error(f"Failed to load encrypted keys: {e}")
+            return {}
+        
+    async def change_password(self, new_password: str) -> bool:
+        """Change the encryption password and re-encrypt all keys"""
+        try:
+            # First, load all wallets with current password
+            wallets = await self.load_keys()
+            
+            # Update password
+            old_password = self.password
+            self.password = new_password
+            
+            # Re-encrypt and save with new password
+            success = await self.save_keys(wallets)
+            
+            if success:
+                logger.info("Wallet encryption password changed successfully")
+                return True
+            else:
+                # Revert to old password on failure
+                self.password = old_password
+                logger.error("Failed to change wallet encryption password")
+                return False
+        except Exception as e:
+            logger.error(f"Error changing wallet encryption password: {e}")
+            return False
+
 class Blockchain:
-    def __init__(self, mfa_manager=None, backup_manager=None, storage_path: str = "chain.db", node_id=None):
+    def __init__(self, mfa_manager=None, backup_manager=None, storage_path: str = "chain.db", 
+                 node_id=None, wallet_password: str = None):
         """Initialize blockchain"""
         from network import BlockchainNetwork
     
@@ -1022,6 +1159,7 @@ class Blockchain:
         self.nonce_tracker = NonceTracker()
         self.mfa_manager = mfa_manager
         self.backup_manager = backup_manager
+        self.key_manager = KeyManager(password=wallet_password)
         
         # Wallet storage
         self.wallets = {}  # Store wallet addresses and their keys
@@ -1180,9 +1318,19 @@ class Blockchain:
             logger.error(f"Failed to save chain: {e}")
             raise
 
+    # Update the wallet handling methods in Blockchain class
+
     async def load_wallets(self):
-        """Load wallets from storage"""
+        """Load wallets from secure storage"""
         try:
+            # First try to load from encrypted storage
+            encrypted_wallets = await self.key_manager.load_keys()
+            if encrypted_wallets:
+                self.wallets = encrypted_wallets
+                logger.info(f"Loaded {len(self.wallets)} wallets from encrypted storage")
+                return
+            
+            # Fall back to database if no encrypted storage
             async with aiosqlite.connect(self.storage_path) as db:
                 async with db.execute('SELECT address, public_key, private_key FROM wallets') as cursor:
                     rows = await cursor.fetchall()
@@ -1192,36 +1340,49 @@ class Blockchain:
                             'public_key': public_key,
                             'private_key': private_key
                         }
-                    logger.info(f"Loaded {len(self.wallets)} wallets from storage")
+                    logger.info(f"Loaded {len(self.wallets)} wallets from database")
+                    
+                    # Migrate to encrypted storage if wallets were loaded from database
+                    if self.wallets:
+                        await self.key_manager.save_keys(self.wallets)
+                        logger.info("Migrated wallet keys to encrypted storage")
         except Exception as e:
             logger.error(f"Failed to load wallets: {e}")
             if "no such table" not in str(e):
                 raise
 
     async def save_wallets(self):
-        """Save wallets to storage"""
+        """Save wallets to secure storage"""
         try:
-            async with aiosqlite.connect(self.storage_path) as db:
-                # Create table if it doesn't exist
-                await db.execute('''
-                    CREATE TABLE IF NOT EXISTS wallets (
-                        address TEXT PRIMARY KEY,
-                        public_key TEXT NOT NULL,
-                        private_key TEXT NOT NULL
-                    )
-                ''')
+            # Save to encrypted storage
+            success = await self.key_manager.save_keys(self.wallets)
+            if not success:
+                logger.error("Failed to save wallets to encrypted storage, falling back to database")
                 
-                # Clear existing wallets
-                await db.execute('DELETE FROM wallets')
-                
-                # Save all wallets
-                for address, wallet in self.wallets.items():
-                    await db.execute(
-                        'INSERT INTO wallets (address, public_key, private_key) VALUES (?, ?, ?)',
-                        (address, wallet['public_key'], wallet['private_key'])
-                    )
-                await db.commit()
-                logger.info(f"Saved {len(self.wallets)} wallets to storage")
+                # Fall back to database
+                async with aiosqlite.connect(self.storage_path) as db:
+                    # Create table if it doesn't exist
+                    await db.execute('''
+                        CREATE TABLE IF NOT EXISTS wallets (
+                            address TEXT PRIMARY KEY,
+                            public_key TEXT NOT NULL,
+                            private_key TEXT NOT NULL
+                        )
+                    ''')
+                    
+                    # Clear existing wallets
+                    await db.execute('DELETE FROM wallets')
+                    
+                    # Save all wallets
+                    for address, wallet in self.wallets.items():
+                        await db.execute(
+                            'INSERT INTO wallets (address, public_key, private_key) VALUES (?, ?, ?)',
+                            (address, wallet['public_key'], wallet['private_key'])
+                        )
+                    await db.commit()
+                    logger.info(f"Saved {len(self.wallets)} wallets to database")
+            else:
+                logger.info(f"Saved {len(self.wallets)} wallets to encrypted storage")
         except Exception as e:
             logger.error(f"Failed to save wallets: {e}")
             raise
@@ -1842,10 +2003,33 @@ class Blockchain:
             'public_key': public_key_hex
         }
         
-        # Save wallets to storage
+        # Save wallets to storage using key manager
         await self.save_wallets()
         
         return address
+    
+    # Add to Blockchain class
+
+    async def change_wallet_password(self, new_password: str) -> bool:
+        """Change the wallet encryption password"""
+        try:
+            # Check that new password isn't empty
+            if not new_password:
+                logger.error("New password cannot be empty")
+                return False
+                
+            # Call the KeyManager's change_password method
+            result = await self.key_manager.change_password(new_password)
+            
+            if result:
+                # Re-save wallets to ensure they're encrypted with the new password
+                await self.save_wallets()
+                logger.info("Wallet password changed successfully")
+            
+            return result
+        except Exception as e:
+            logger.error(f"Failed to change wallet password: {e}")
+            return False
 
     async def get_wallet(self, address: str) -> Optional[Dict[str, str]]:
         """Get wallet information for an address"""
@@ -1972,10 +2156,14 @@ class ResourceMonitor:
             pass
 
 class BlockchainNode:
-    def __init__(self):
+    def __init__(self, wallet_password: str = None):
         """Initialize a blockchain node with all services"""
+
         # Create blockchain instance
-        self.blockchain = Blockchain(node_id=f"node-{int(time.time())}")
+        self.blockchain = Blockchain(
+            node_id=f"node-{int(time.time())}",
+            wallet_password=wallet_password
+            )
         
         # Create resource monitor
         self.resource_monitor = ResourceMonitor(self.blockchain)
@@ -1988,6 +2176,8 @@ class BlockchainNode:
         self.status_var = None
         self.mining_btn = None
         self.notebook = None
+
+        self.wallet_password = wallet_password
 
     async def start(self):
         """Start all blockchain node services"""
