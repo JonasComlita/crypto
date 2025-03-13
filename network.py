@@ -22,7 +22,6 @@ from blockchain import Blockchain, Block, Transaction
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
-logging.basicConfig(level=logging.DEBUG)
 
 # Configuration
 CONFIG = {
@@ -178,7 +177,8 @@ class BlockchainNetwork:
                     f'openssl req -x509 -newkey rsa:2048 -keyout "{key_path}" '
                     f'-out "{cert_path}" -days 365 -nodes -subj "/CN={self.node_id}"'
                 )
-                result = os.system(cmd)
+                with open(os.devnull, 'w') as devnull:
+                    result = os.system(f"{cmd} > {os.devnull} 2>&1")
                 if result != 0:
                     raise RuntimeError(f"Failed to generate SSL certificates for {self.node_id} on port {self.port} with OpenSSL")
                 logger.info(f"Generated self-signed certificates: {cert_path}, {key_path}")

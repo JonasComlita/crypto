@@ -40,7 +40,8 @@ async def main(node_id: Optional[str] = None, is_validator: bool = False,
             f'openssl req -x509 -newkey rsa:2048 -keyout "{key_path}" '
             f'-out "{cert_path}" -days 365 -nodes -subj "/CN={node_id}"'
         )
-        result = os.system(cmd)
+        with open(os.devnull, 'w') as devnull:
+            result = os.system(f"{cmd} > {os.devnull} 2>&1")
         if result != 0:
             raise RuntimeError(f"Failed to generate SSL certificates for {node_id} on port {port}")
         logger.info(f"Generated self-signed certificates: {cert_path}, {key_path}")

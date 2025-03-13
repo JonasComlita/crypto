@@ -18,6 +18,7 @@ import queue
 import threading
 import datetime
 import gc
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -873,11 +874,17 @@ class BlockchainGUI:
         asyncio.run_coroutine_threadsafe(self.restore_keys(), self.loop)
 
     def on_closing(self):
-        """Handle application shutdown"""
+        """Improved application shutdown handler for GUI window close events"""
         logger.info("Starting application shutdown...")
         try:
-            # Show shutdown message
+            # Display shutdown message
             self.status_var.set("Shutting down...")
+            
+            # Flag to prevent multiple shutdown attempts
+            if hasattr(self, '_shutdown_in_progress') and self._shutdown_in_progress:
+                logger.info("Shutdown already in progress")
+                return
+            self._shutdown_in_progress = True
             
             # Define cleanup coroutine
             async def cleanup():
@@ -901,36 +908,60 @@ class BlockchainGUI:
                 finally:
                     # Signal event loop to stop
                     self.shutdown_event.set()
-                    self.loop.stop()
-                    self.is_running = False
+                    
+                    # Only stop the loop if it's still running
+                    try:
+                        if not self.loop.is_closed():
+                            self.loop.stop()
+                    except Exception as e:
+                        logger.error(f"Error stopping loop: {e}")
             
-            # Run cleanup in event loop and wait for it to complete
-            future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
-            future.result(timeout=10)
+            # Create a future to track cleanup progress
+            cleanup_future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
             
-            # Destroy GUI
+            # Schedule GUI exit after a short delay
+            self.root.after(500, self._delayed_exit, cleanup_future)
+            
+        except Exception as e:
+            logger.error(f"Error starting shutdown: {e}")
+            # Force destroy as a last resort
+            try:
+                self.root.destroy()
+            except:
+                pass
+
+    def _delayed_exit(self, cleanup_future):
+        """Handle delayed GUI exit after cleanup starts"""
+        try:
+            # Check if cleanup is done or wait a short time
+            try:
+                cleanup_future.result(timeout=3)
+                logger.info("Async cleanup completed successfully")
+            except concurrent.futures.TimeoutError:
+                logger.warning("Async cleanup timed out, proceeding with GUI exit")
+            except Exception as e:
+                logger.error(f"Error in async cleanup: {e}")
+            
+            # Destroy the GUI
             self.root.quit()
             self.root.destroy()
             logger.info("GUI destroyed")
             
-            # Wait for event loop thread to end
-            self.loop_thread.join(timeout=5)
-            if self.loop_thread.is_alive():
-                logger.warning("Event loop thread did not terminate cleanly")
-                import psutil
-                current_process = psutil.Process()
-                children = current_process.children(recursive=True)
-                for child in children:
-                    logger.warning(f"Terminating child process: {child.pid}")
-                    child.terminate()
-            else:
-                logger.info("Event loop thread terminated")
-                
         except Exception as e:
-            logger.error(f"Shutdown error: {e}")
-            # Force exit in case of serious errors
-            import os
-            os._exit(1)
+            logger.error(f"Error during GUI exit: {e}")
+            # Force exit as a last resort
+            try:
+                import os
+                os._exit(1)
+            except:
+                pass
+
+    def exit(self):
+        """Add an explicit exit method for external shutdown calls"""
+        if not hasattr(self, '_shutdown_in_progress') or not self._shutdown_in_progress:
+            self.on_closing()
+        else:
+            logger.info("Exit called while shutdown in progress")
 
     def cleanup_resources(self):
         """Periodic cleanup of resources"""

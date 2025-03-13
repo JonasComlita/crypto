@@ -31,6 +31,56 @@ handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCo
 logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("Blockchain")
 
+def _do_mining_work( block_data: dict, difficulty: int) -> Optional[dict]:
+    """CPU-intensive mining work (runs in a separate process)"""
+    try:
+        logger.debug("Starting mining work in process...")
+        logger.debug(f"Received block data keys: {list(block_data.keys())}")
+        
+        target = "0" * difficulty
+        max_nonce = 2**32
+        nonce = 0
+        total_hashes = 0
+        
+        # Create block string for hashing
+        try:
+            block_string_base = (
+                f"{block_data['index']}"
+                f"{block_data['timestamp']}"
+                f"{json.dumps(block_data['transactions'], sort_keys=True)}"
+                f"{block_data['previous_hash']}"
+            )
+            logger.debug("Block string base created successfully")
+        except Exception as e:
+            logger.error(f"Error creating block string: {str(e)}")
+            logger.error(f"Block data content: {block_data}")
+            raise
+        
+        while nonce < max_nonce:
+            # Calculate hash with current nonce
+            block_string = f"{block_string_base}{nonce}"
+            block_hash = hashlib.sha256(block_string.encode()).hexdigest()
+            total_hashes += 1
+            
+            if block_hash.startswith(target):
+                logger.debug(f"Found valid hash after {total_hashes} attempts")
+                return {
+                    'nonce': nonce,
+                    'hash': block_hash,
+                    'hashes': total_hashes
+                }
+            
+            nonce += 1
+        
+        logger.debug(f"Max nonce reached after {total_hashes} attempts")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Mining work error: {str(e)}", exc_info=True)
+        logger.error(f"Error occurred with difficulty: {difficulty}")
+        return None
+
+
 class Transaction:
     def __init__(self, sender: str, recipient: str, amount: float, 
              tx_type: TransactionType = TransactionType.TRANSFER,
@@ -188,6 +238,9 @@ class Transaction:
     async def verify(self) -> bool:
         """Verify transaction signature"""
         try:
+            if self.tx_type == TransactionType.COINBASE:
+                return True
+            
             if hasattr(self, 'inputs') and self.inputs:
                 # UTXO-based transaction verification
                 message = json.dumps(self.to_dict(exclude_signature=True), sort_keys=True).encode()
@@ -365,6 +418,10 @@ class Block:
             safe_transactions = []
             for tx in self.transactions:
                 try:
+                    if asyncio.isfuture(tx.signature):
+                        logger.error(f"Found Future signature in tx {tx.tx_id}")
+                        raise ValueError("Signature cannot be a Future")
+                    
                     safe_tx = {
                         'tx_id': str(tx.tx_id),
                         'sender': str(tx.sender) if tx.sender else "0",
@@ -776,7 +833,7 @@ class AsyncMiner:
             
             mining_result = await asyncio.get_event_loop().run_in_executor(
                 self._process_pool,
-                self._do_mining_work,
+                _do_mining_work,
                 block_data,
                 self.blockchain.difficulty
             )
@@ -786,55 +843,6 @@ class AsyncMiner:
             return mining_result
         except Exception as e:
             logger.error(f"Mining execution error: {str(e)}", exc_info=True)
-            return None
-
-    def _do_mining_work(self, block_data: dict, difficulty: int) -> Optional[dict]:
-        """CPU-intensive mining work (runs in a separate process)"""
-        try:
-            logger.debug("Starting mining work in process...")
-            logger.debug(f"Received block data keys: {list(block_data.keys())}")
-            
-            target = "0" * difficulty
-            max_nonce = 2**32
-            nonce = 0
-            total_hashes = 0
-            
-            # Create block string for hashing
-            try:
-                block_string_base = (
-                    f"{block_data['index']}"
-                    f"{block_data['timestamp']}"
-                    f"{json.dumps(block_data['transactions'], sort_keys=True)}"
-                    f"{block_data['previous_hash']}"
-                )
-                logger.debug("Block string base created successfully")
-            except Exception as e:
-                logger.error(f"Error creating block string: {str(e)}")
-                logger.error(f"Block data content: {block_data}")
-                raise
-            
-            while nonce < max_nonce:
-                # Calculate hash with current nonce
-                block_string = f"{block_string_base}{nonce}"
-                block_hash = hashlib.sha256(block_string.encode()).hexdigest()
-                total_hashes += 1
-                
-                if block_hash.startswith(target):
-                    logger.debug(f"Found valid hash after {total_hashes} attempts")
-                    return {
-                        'nonce': nonce,
-                        'hash': block_hash,
-                        'hashes': total_hashes
-                    }
-                
-                nonce += 1
-            
-            logger.debug(f"Max nonce reached after {total_hashes} attempts")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Mining work error: {str(e)}", exc_info=True)
-            logger.error(f"Error occurred with difficulty: {difficulty}")
             return None
 
     def get_hashrate(self) -> float:
@@ -1233,6 +1241,7 @@ class Blockchain:
         """Validate block against consensus rules"""
         async with self._lock:
             try:
+                logger.info(f"Starting validation for block {block.index}")
                 # Check block is properly linked to chain
                 if block.index > 0:
                     if block.index > len(self.chain):
@@ -1317,8 +1326,16 @@ class Blockchain:
                 tasks = [tx.verify() for tx in block.transactions]
                 results = await asyncio.gather(*tasks)
                 if not all(results):
-                    logger.warning(f"Block {block.index} contains invalid transaction signatures")
-                    return False
+                    logger.info(f"Validating {len(block.transactions)} transaction signatures")
+                    for i, tx in enumerate(block.transactions):
+                        if not await tx.verify():
+                            logger.warning(f"Transaction {i} (tx_id: {tx.tx_id[:8]}) in block {block.index} failed signature verification")
+                            logger.warning(f"Transaction type: {tx.tx_type}")
+                            if hasattr(tx, 'signature'):
+                                logger.warning(f"Signature present: {tx.signature is not None}, Type: {type(tx.signature)}")
+                            else:
+                                logger.warning("Transaction has no signature attribute")
+                            return False
 
                 return True
             except Exception as e:
@@ -1337,49 +1354,56 @@ class Blockchain:
                 # Check if block fits at the end of current chain
                 if block.index == len(self.chain) and block.previous_hash == self.chain[-1].hash:
                     # Validate block
-                    if await self.validate_block(block):
-                        # Add block to chain
-                        self.chain.append(block)
-                        
-                        # Update UTXO set with new block
-                        await self.utxo_set.update_with_block(block)
-                        
-                        # Check if we need to adjust difficulty
-                        if len(self.chain) % 2016 == 0:
-                            self.adjust_difficulty()
-                            
-                        # Check if we need to halve block reward
-                        if len(self.chain) % self.halving_interval == 0:
-                            self.halve_block_reward()
-                            
-                        # Add checkpoint if needed
-                        if len(self.chain) % self.checkpoint_interval == 0:
-                            self.checkpoints.append(len(self.chain) - 1)
-                            
-                        # Notify listeners
-                        self.trigger_event("new_block", block)
-                        
-                        # Save chain to storage
-                        await self.save_chain()
-                        
-                        # Update metrics
-                        self.update_metrics()
-                        
-                        # Process any orphan blocks that might now fit
-                        await self._process_orphans()
-                        
-                        # Increment blocks mined counter
-                        BLOCKS_MINED.labels(instance=self.node_id).inc()
-               
-                        # Remove block's transactions from mempool
-                        await self._remove_block_txs_from_mempool(block)
-                        
-                        logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}, chain length: {len(self.chain)}")
-                        return True
-                    else:
+                    is_valid = await self.validate_block(block)
+                    if not is_valid:
                         logger.warning(f"Block {block.index} failed validation: {block.hash[:8]}")
+                        return False
+                        
+                    # More detailed logging:
+                    logger.info(f"Block validation successful for block {block.index}")
+                    logger.info(f"Adding block {block.index} with hash {block.hash[:8]}")
+                    logger.info(f"Previous block hash: {self.chain[-1].hash[:8]}")
+                    logger.info(f"Block transactions: {len(block.transactions)}")
+
+                    self.chain.append(block)
+                        
+                    # Check if we need to adjust difficulty
+                    if len(self.chain) % 2016 == 0:
+                        self.adjust_difficulty()
+                        
+                    # Check if we need to halve block reward
+                    if len(self.chain) % self.halving_interval == 0:
+                        self.halve_block_reward()
+                        
+                    # Add checkpoint if needed
+                    if len(self.chain) % self.checkpoint_interval == 0:
+                        self.checkpoints.append(len(self.chain) - 1)
+                        
+                    # Notify listeners
+                    self.trigger_event("new_block", block)
+                    
+                    # Save chain to storage
+                    await self.save_chain()
+                    
+                    # Update metrics
+                    self.update_metrics()
+                    
+                    # Process any orphan blocks that might now fit
+                    await self._process_orphans()
+                    
+                    # Increment blocks mined counter
+                    BLOCKS_MINED.labels(instance=self.node_id).inc()
+            
+                    # Remove block's transactions from mempool
+                    await self._remove_block_txs_from_mempool(block)
+                    
+                    logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}, chain length: {len(self.chain)}")
+                    return True
                 else:
                     logger.info(f"Block {block.index} doesn't follow chain tip, handling as potential fork")
+                    logger.info(f"Block index: {block.index}, Chain length: {len(self.chain)}")
+                    logger.info(f"Block previous_hash: {block.previous_hash[:8]}")
+                    logger.info(f"Chain tip hash: {self.chain[-1].hash[:8]}")
                     await self.handle_potential_fork(block)
                 return False
             except Exception as e:
