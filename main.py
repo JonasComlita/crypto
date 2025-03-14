@@ -265,17 +265,36 @@ async def async_main(args, loop, wallet_password: str):
         # Initialize blockchain with default password first
         blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=port)  # No password yet
         
-        bootstrap_nodes = []
+         # Check for bootstrap nodes from args before defaulting to empty list
+        if args.bootstrap:
+            try:
+                # Split comma-separated string into list of host:port pairs
+                bootstrap_nodes = []
+                for node in args.bootstrap.split(","):
+                    node = node.strip()
+                    host, port_str = node.split(":")
+                    port_num = int(port_str)
+                    if not validate_port(port_num) or not host:
+                        raise ValueError(f"Invalid bootstrap node format: {node}")
+                    bootstrap_nodes.append((host, port_num))
+                logger.info(f"Using bootstrap nodes from args: {bootstrap_nodes}")
+            except Exception as e:
+                logger.error(f"Failed to parse bootstrap nodes '{args.bootstrap}': {e}")
+                logger.info("Falling back to no bootstrap nodes")
+                bootstrap_nodes = []
+        else:
+            bootstrap_nodes = []
+            logger.info("No bootstrap nodes provided, starting with empty peer list")
 
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
-        await init_rotation_manager(node_id)
-        rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator, backup_manager=backup_manager)
-        
+        from utils import rotation_manager
+        if not rotation_manager:
+            await init_rotation_manager(node_id)  # Initializes global rotation_manager
+        # Use the global instance directly instead of creating a new one
         network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, bootstrap_nodes, security_monitor=security_monitor)
         network.loop = loop
-        await network.start()
+        network_start_task = asyncio.create_task(network.start())
         
-        await rotation_manager.start()
         from key_rotation.main import main as rotation_main
         shutdown_event = asyncio.Event()
         asyncio.create_task(rotation_main(node_id, args.validator, api_port, "127.0.0.1", loop, shutdown_event))

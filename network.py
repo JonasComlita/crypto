@@ -130,7 +130,7 @@ class BlockchainNetwork:
         self.setup_routes()
         self.sync_task: Optional[asyncio.Task] = None
         self.discovery_task: Optional[asyncio.Task] = None
-        self.last_announcement = 0
+        self.last_announcement = time.time()
         self.peer_failures: Dict[str, int] = defaultdict(int)
         self.start_time = time.time()
         self.lock = threading.Lock() 
@@ -242,7 +242,7 @@ class BlockchainNetwork:
             asyncio.create_task(self.security_monitor.analyze_patterns())
 
         # Start the server and sync tasks
-        await self.start_server()
+        self.server_task_handle = asyncio.create_task(self.start_server())
         logger.info("Network service started")
 
     def run(self):
@@ -276,6 +276,10 @@ class BlockchainNetwork:
     async def send_with_retry(self, url: str, data: dict, method: str = "post", 
                             max_retries: int = CONFIG["max_retries"]) -> Tuple[bool, Optional[dict]]:
         """Send HTTP request with retry logic."""
+        from utils import rotation_manager
+        if rotation_manager is None:
+            logger.error("Rotation manager not initialized in send_with_retry")
+            return False, None
         # Get auth secret asynchronously
         auth_secret = await PEER_AUTH_SECRET()
         headers = {"Authorization": f"Bearer {auth_secret}"}
@@ -283,15 +287,19 @@ class BlockchainNetwork:
         with ACTIVE_REQUESTS.labels(instance=self.node_id).track_inprogress():
             for attempt in range(max_retries):
                 try:
+                    logger.debug(f"Sending {method} request to {url}, attempt {attempt + 1}/{max_retries + 1}")
                     async with aiohttp.ClientSession() as session:
                         if method == "post":
                             async with session.post(url, json=data, headers=headers, 
                                                   ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                                logger.debug(f"Received response from {url}: status {resp.status}")
                                 return resp.status == 200, None
                         elif method == "get":
                             async with session.get(url, headers=headers, 
                                                  ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                                 return resp.status == 200, await resp.json() if resp.status == 200 else None
+                        else:
+                            logger.error(f"Unsupported request method: {method}")
                 except Exception as e:
                     logger.warning(f"Request to {url} failed (attempt {attempt + 1}/{max_retries}): {e}")
                     if attempt == max_retries - 1:
@@ -511,9 +519,11 @@ class BlockchainNetwork:
                 if (host, port) != (self.host, self.port):
                     peer_id = f"node{port}"
                     url = f"https://{host}:{port}/get_chain"
-                    success, _ = await self.send_with_retry(url, {}, method="get")
+                    logger.debug(f"Attempting to discover peer {peer_id} at {url}")
+                    success, response = await self.send_with_retry(url, {}, method="get")
                     if success:
-                        await self.add_peer(peer_id, host, port, PEER_AUTH_SECRET())
+                        if await self.add_peer(peer_id, host, port, PEER_AUTH_SECRET()):
+                            logger.debug(f"Successfully added bootstrap node {peer_id}")
                     else:
                         logger.debug(f"Skipping unresponsive bootstrap node {peer_id}")
 
@@ -534,18 +544,37 @@ class BlockchainNetwork:
 
     async def add_peer(self, peer_id: str, host: str, port: int, public_key: str) -> bool:
         """Add a peer to the network."""
+        from utils import PEER_AUTH_SECRET
+        
+        # Get auth_secret first (async operation)
+        auth_secret = await PEER_AUTH_SECRET()
+        
+        # Synchronous block to update peers
         with self.lock:
             if len(self.peers) >= CONFIG["max_peers"] and peer_id not in self.peers:
+                logger.debug(f"Cannot add peer {peer_id}: max peers ({CONFIG['max_peers']}) reached")
                 return False
+            
             peer_key = (host, port)
-            if peer_id not in self.peers or self.peers[peer_id][:2] != peer_key:
-                self.peers[peer_id] = (host, port, public_key)
-                logger.info(f"Added peer {peer_id}: {host}:{port}")
-                if time.time() - self.last_announcement > 10:
-                    await self.broadcast_peer_announcement()
+            if peer_id not in self.peers or self.peers[peer_id]["host"] != host or self.peers[peer_id]["port"] != port:
+                self.peers[peer_id] = {
+                    "host": host,
+                    "port": port,
+                    "public_key": public_key,
+                    "auth_secret": auth_secret,
+                    "failed_attempts": 0,
+                    "last_seen": time.time()
+                }
+                logger.info(f"Added/updated peer {peer_id}: {host}:{port}")
+                should_broadcast = time.time() - self.last_announcement > 10
+                if should_broadcast:
                     self.last_announcement = time.time()
+                    await self.broadcast_peer_announcement()
+                    logger.debug(f"Broadcasted peer announcement after adding {peer_id}")
                 return True
-            return False
+            else:
+                logger.debug(f"Peer {peer_id} already exists with same host/port")
+                return False
 
     def _increment_failure(self, peer_id: str) -> None:
         """Track peer failures and remove unresponsive peers."""

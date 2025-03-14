@@ -485,11 +485,14 @@ class KeyRotationManager:
     async def start(self) -> None:
         """Start the key rotation manager."""
         try:
+            # Load or initialize secrets immediately
             await self._load_auth_secrets()
+            # Ensure P2P network starts after secrets are loaded
             await self._p2p.start()
             self._running = True
+            # Start scheduler in the background
             asyncio.create_task(self._run_scheduler())
-            logger.info(f"KeyRotationManager started for node {self.node_id}")
+            logger.info(f"KeyRotationManager started for node {self.node_id} with auth secret initialized")
         except Exception as e:
             logger.error(f"Failed to start KeyRotationManager: {e}")
             raise

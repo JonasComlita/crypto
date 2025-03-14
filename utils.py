@@ -32,9 +32,11 @@ rotation_manager: Optional[KeyRotationManager] = None
 async def init_rotation_manager(node_id: str) -> None:
     """Initialize the KeyRotationManager for the node."""
     global rotation_manager
-    start_time = time.time()
-    rotation_manager = KeyRotationManager(node_id=node_id)
-    logger.info(f"Initialized KeyRotationManager for {node_id} in {(time.time() - start_time):.3f} seconds")
+    if rotation_manager is None:
+            from key_rotation.core import KeyRotationManager
+            rotation_manager = KeyRotationManager(node_id=node_id)
+            await rotation_manager.start()
+    logger.debug(f"Rotation manager initialized for {node_id}")
 
 async def get_peer_auth_secret() -> str:
     """Retrieve the current peer authentication secret."""

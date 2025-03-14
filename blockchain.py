@@ -115,7 +115,7 @@ class Transaction:
             self.tx_type = TransactionType.COINBASE
             self.fee = 0.0
             self.inputs = []
-            self.outputs = []
+            self.outputs = [TransactionOutput(recipient=recipient, amount=amount)]
         # Simple transfer
         elif sender is not None and recipient is not None and amount is not None:
             self.sender = sender
@@ -500,30 +500,47 @@ class UTXOSet:
         self.used_nonces: Dict[str, set] = {}
         self._lock = asyncio.Lock()
 
+    # In blockchain.py, within UTXOSet class
     async def update_with_block(self, block: Block):
         async with self._lock:
             try:
                 for tx in block.transactions:
-                    # Add transaction outputs to UTXO set
-                    for i, output in enumerate(tx.outputs):
-                        if tx.tx_id not in self.utxos:
-                            self.utxos[tx.tx_id] = []
-                        while len(self.utxos[tx.tx_id]) <= i:
-                            self.utxos[tx.tx_id].append(None)
-                        self.utxos[tx.tx_id][i] = output
-                    
-                    # Remove spent transaction inputs
-                    for input in tx.inputs:
-                        if input.tx_id in self.utxos and input.output_index < len(self.utxos[input.tx_id]):
-                            self.utxos[input.tx_id][input.output_index] = None
-                    
-                    # Add nonces for replay protection
-                    if tx.tx_type != TransactionType.COINBASE:
+                    logger.debug(f"Updating UTXO for tx {tx.tx_id}: {len(tx.inputs)} inputs, {len(tx.outputs)} outputs")
+                    if tx.tx_type == TransactionType.COINBASE:
+                        # Handle coinbase transaction (mining reward)
+                        if tx.recipient:  # Ensure recipient is valid
+                            if tx.tx_id not in self.utxos:
+                                self.utxos[tx.tx_id] = []
+                            # Create a TransactionOutput for the coinbase reward
+                            coinbase_output = TransactionOutput(
+                                recipient=tx.recipient,
+                                amount=tx.amount,
+                                script=""  # Empty script for simplicity
+                            )
+                            self.utxos[tx.tx_id].append(coinbase_output)
+                            logger.info(f"Added coinbase UTXO for {tx.recipient} with amount {tx.amount}")
+                    else:
+                        # Add transaction outputs to UTXO set
+                        for i, output in enumerate(tx.outputs):
+                            if tx.tx_id not in self.utxos:
+                                self.utxos[tx.tx_id] = []
+                            while len(self.utxos[tx.tx_id]) <= i:
+                                self.utxos[tx.tx_id].append(None)
+                            self.utxos[tx.tx_id][i] = output
+                        
+                        # Remove spent transaction inputs
                         for input in tx.inputs:
-                            if input.public_key:
-                                address = SecurityUtils.public_key_to_address(input.public_key)
-                                if tx.nonce is not None:  # Ensure nonce exists
-                                    self.used_nonces.setdefault(address, set()).add(tx.nonce)
+                            if input.tx_id in self.utxos and input.output_index < len(self.utxos[input.tx_id]):
+                                logger.debug(f"Removing spent UTXO {input.tx_id}[{input.output_index}]")
+                                self.utxos[input.tx_id][input.output_index] = None
+                        
+                        # Add nonces for replay protection
+                        if tx.tx_type != TransactionType.COINBASE:
+                            for input in tx.inputs:
+                                if input.public_key:
+                                    address = SecurityUtils.public_key_to_address(input.public_key)
+                                    if tx.nonce is not None:
+                                        self.used_nonces.setdefault(address, set()).add(tx.nonce)
             except Exception as e:
                 logger.error(f"Failed to update UTXO set with block {block.index}: {e}")
                 raise
@@ -537,11 +554,11 @@ class UTXOSet:
                         result.append((tx_id, i, output))
             return result
 
-    async def get_utxo(self, tx_id: str, output_index: int) -> Optional[TransactionOutput]:
-        async with self._lock:
-            if tx_id in self.utxos and output_index < len(self.utxos[tx_id]):
-                return self.utxos[tx_id][output_index]
-            return None
+    async def get_balance(self, address: str) -> float:
+        utxos = await self.get_utxos_for_address(address)
+        balance = sum(utxo[2].amount for utxo in utxos if utxo[2] is not None)
+        logger.debug(f"Calculated balance for {address}: {balance} from {len(utxos)} UTXOs")
+        return balance
 
     async def get_balance(self, address: str) -> float:
         utxos = await self.get_utxos_for_address(address)
@@ -624,10 +641,6 @@ class AsyncMiner:
         self._lock = asyncio.Lock()
         self.hashrate_lock = asyncio.Lock()
         self.mining_lock = asyncio.Lock()
-        self._stats = {
-            'hashrate': 0,
-            'blocks_mined': 0
-        }
         
         # Logging
         self._logger = logging.getLogger(__name__)
@@ -791,6 +804,17 @@ class AsyncMiner:
                     
                 # Get transactions from mempool
                 transactions = await self.blockchain.mempool.get_transactions(1000, 1000000)
+                
+                 # Use the wallet address from the miner or fallback to first available
+                wallet_address = self.wallet_address
+                if not wallet_address and self.blockchain.wallets:
+                    wallet_address = next(iter(self.blockchain.wallets.keys()))
+                    self._logger.info(f"Using fallback wallet: {wallet_address}")
+                
+                if not wallet_address:
+                    self._logger.error("No valid wallet address for mining")
+                    return None
+            
                 for transaction in transactions:
                     logger.debug(f"Transaction {transaction.tx_id}: signature type = {type(transaction.signature)}")
                 # Create coinbase transaction (mining reward)
@@ -871,7 +895,6 @@ class AsyncMiner:
             # Update last values for next calculation
             self.last_hash_count = self.total_hashes
             self.last_hash_time = current_time
-            self.stats['hashrate'] = hashrate
             return hashrate
         return 0.0
 
@@ -1122,7 +1145,7 @@ class Blockchain:
         
         # Chain storage
         self.chain: List[Block] = []
-        self.storage_path = storage_path
+        self.storage_path = storage_path if storage_path else f"chain_{node_id or 'default'}.db"
         
         # Mining parameters
         self.difficulty = CONFIG["difficulty"]
@@ -1411,7 +1434,6 @@ class Blockchain:
             except Exception as e:
                 logger.error(f"Failed to update metrics: {e}")
 
-
     async def validate_block(self, block: Block) -> bool:
         """Validate block against consensus rules"""
         async with self._lock:
@@ -1540,40 +1562,48 @@ class Blockchain:
                     logger.info(f"Previous block hash: {self.chain[-1].hash[:8]}")
                     logger.info(f"Block transactions: {len(block.transactions)}")
 
-                    self.chain.append(block)
+                    try:
+                        # ... existing validation and chain append logic ...
+                        if await self.validate_block(block):
+                            self.chain.append(block)
+                            await self.utxo_set.update_with_block(block)  # Explicitly update UTXO set
                         
-                    # Check if we need to adjust difficulty
-                    if len(self.chain) % 2016 == 0:
-                        self.adjust_difficulty()
+                            # Check if we need to adjust difficulty
+                        if len(self.chain) % 2016 == 0:
+                            self.adjust_difficulty()
+                            
+                        # Check if we need to halve block reward
+                        if len(self.chain) % self.halving_interval == 0:
+                            self.halve_block_reward()
+                            
+                        # Add checkpoint if needed
+                        if len(self.chain) % self.checkpoint_interval == 0:
+                            self.checkpoints.append(len(self.chain) - 1)
+                            
+                        # Notify listeners
+                        self.trigger_event("new_block", block)
                         
-                    # Check if we need to halve block reward
-                    if len(self.chain) % self.halving_interval == 0:
-                        self.halve_block_reward()
+                        # Save chain to storage
+                        await self.save_chain()
                         
-                    # Add checkpoint if needed
-                    if len(self.chain) % self.checkpoint_interval == 0:
-                        self.checkpoints.append(len(self.chain) - 1)
+                        # Update metrics
+                        await self.update_metrics()
                         
-                    # Notify listeners
-                    self.trigger_event("new_block", block)
+                        # Process any orphan blocks that might now fit
+                        await self._process_orphans()
+                        
+                        # Increment blocks mined counter
+                        BLOCKS_MINED.labels(instance=self.node_id).inc()
+                
+                        # Remove block's transactions from mempool
+                        await self._remove_block_txs_from_mempool(block)
+                        
+                        logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}, chain length: {len(self.chain)}")
+                        return True
                     
-                    # Save chain to storage
-                    await self.save_chain()
-                    
-                    # Update metrics
-                    await self.update_metrics()
-                    
-                    # Process any orphan blocks that might now fit
-                    await self._process_orphans()
-                    
-                    # Increment blocks mined counter
-                    BLOCKS_MINED.labels(instance=self.node_id).inc()
-            
-                    # Remove block's transactions from mempool
-                    await self._remove_block_txs_from_mempool(block)
-                    
-                    logger.info(f"Successfully added block {block.index} to chain: {block.hash[:8]}, chain length: {len(self.chain)}")
-                    return True
+                    except Exception as e:
+                        logger.error(f"Failed to add block {block.index}: {e}")
+                        return False
                 else:
                     logger.info(f"Block {block.index} doesn't follow chain tip, handling as potential fork")
                     logger.info(f"Block index: {block.index}, Chain length: {len(self.chain)}")
@@ -1958,6 +1988,9 @@ class Blockchain:
                     for output in tx.outputs:
                         if hasattr(output, 'recipient') and output.recipient:
                             addresses.add(output.recipient)
+
+        # Add addresses from local wallet storage
+        addresses.update(self.wallets.keys())
                 
         # Remove genesis, null addresses
         addresses.discard("0")
@@ -2058,7 +2091,10 @@ class Blockchain:
         logger.info("Attempting to start mining...")
         try:
             # If no wallet address provided, use first available
-            if not wallet_address:
+            if self.wallets:
+                wallet_address = next(iter(self.wallets.keys()))
+                logger.info(f"Using existing wallet from storage: {wallet_address}")
+            else:
                 addresses = await self.get_all_addresses()
                 if not addresses:
                     # Create a new wallet if none exist
@@ -2122,7 +2158,7 @@ class ResourceMonitor:
         """Start monitoring system resources"""
         if self._running:
             return
-            
+                
         self._running = True
         self._task = asyncio.create_task(self.monitor_resources())
         logger.info("Resource monitor started")

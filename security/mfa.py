@@ -56,12 +56,12 @@ class MFAManager:
         except Exception as e:
             logger.error(f"Error saving MFA configurations: {e}")
 
-    async def generate_mfa_secret(self, user_id: str) -> str:
+    async def generate_mfa_secret(self, wallet_address: str) -> str:
         """
         Generate new MFA secret for a user
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
         
         Returns:
             str: Generated MFA secret
@@ -71,28 +71,28 @@ class MFAManager:
         """
         try:
             # Check if MFA is already configured
-            if user_id in self.mfa_secrets:
-                logger.warning(f"MFA already configured for {user_id}. Regenerating...")
+            if wallet_address in self.mfa_secrets:
+                logger.warning(f"MFA already configured for {wallet_address}. Regenerating...")
             
             # Generate new secret
             secret = pyotp.random_base32()
-            self.mfa_secrets[user_id] = secret
+            self.mfa_secrets[wallet_address] = secret
             
             # Persist configuration
             self._save_mfa_configs()
             
-            logger.info(f"Generated MFA secret for {user_id}")
+            logger.info(f"Generated MFA secret for {wallet_address}")
             return secret
         except Exception as e:
             logger.error(f"Error generating MFA secret: {e}")
             raise MFAManagerException(f"Failed to generate MFA secret: {e}")
 
-    async def get_mfa_qr(self, user_id: str, username: str) -> Image.Image:
+    async def get_mfa_qr(self, wallet_address: str, username: str) -> Image.Image:
         """
         Generate QR code for MFA setup
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
             username (str): Username for the QR code
         
         Returns:
@@ -103,11 +103,13 @@ class MFAManager:
         """
         try:
             # Ensure MFA secret exists
-            if user_id not in self.mfa_secrets:
-                raise MFAManagerException(f"MFA not set up for user {user_id}")
+            if wallet_address not in self.mfa_secrets:
+                raise MFAManagerException(f"MFA not set up for user {wallet_address}")
             
+            secret = self.mfa_secrets[wallet_address]
+            logger.debug(f"Generating QR with secret for {wallet_address}: {secret}")
             # Create TOTP object
-            totp = pyotp.TOTP(self.mfa_secrets[user_id])
+            totp = pyotp.TOTP(secret)
             
             # Generate provisioning URI
             provisioning_uri = totp.provisioning_uri(
@@ -115,6 +117,7 @@ class MFAManager:
                 issuer_name="OriginalCoin"
             )
             
+            logger.debug(f"Provisioning URI: {provisioning_uri}")
             # Create QR code
             qr = qrcode.QRCode(version=1, box_size=10, border=5)
             qr.add_data(provisioning_uri)
@@ -125,24 +128,24 @@ class MFAManager:
             logger.error(f"Error generating MFA QR code: {e}")
             raise MFAManagerException(f"Failed to generate MFA QR code: {e}")
 
-    async def is_mfa_configured(self, user_id: str) -> bool:
+    async def is_mfa_configured(self, wallet_address: str) -> bool:
         """
         Check if MFA is configured for a specific user
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
         
         Returns:
             bool: True if MFA is configured, False otherwise
         """
-        return user_id in self.mfa_secrets
+        return wallet_address in self.mfa_secrets
 
-    def verify_mfa(self, user_id: str, code: str) -> bool:
+    def verify_mfa(self, wallet_address: str, code: str) -> bool:
         """
         Verify MFA code
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
             code (str): MFA code to verify
         
         Returns:
@@ -150,72 +153,74 @@ class MFAManager:
         """
         try:
             # Check if MFA is configured
-            if user_id not in self.mfa_secrets:
-                logger.warning(f"No MFA secret found for user {user_id}")
+            if wallet_address not in self.mfa_secrets:
+                logger.warning(f"No MFA secret found for user {wallet_address}")
                 return False
             
             # Create TOTP object
-            totp = pyotp.TOTP(self.mfa_secrets[user_id])
+            secret = self.mfa_secrets[wallet_address]
+            logger.debug(f"Verifying MFA for {wallet_address} with secret: {secret}, code: {code}")
+            totp = pyotp.TOTP(secret)
             
             # Verify code with additional window for clock skew
             if totp.verify(code, valid_window=1):
                 # Record verified session
-                self.verified_sessions[user_id] = datetime.now()
-                logger.info(f"MFA verified for user {user_id}")
+                self.verified_sessions[wallet_address] = datetime.now()
+                logger.info(f"MFA verified for user {wallet_address}")
                 return True
             
-            logger.warning(f"Invalid MFA code for user {user_id}")
+            logger.warning(f"Invalid MFA code for wallet {wallet_address}")
             return False
         except Exception as e:
-            logger.error(f"MFA verification error for user {user_id}: {e}")
+            logger.error(f"MFA verification error for wallet {wallet_address}: {e}")
             return False
 
-    def is_session_valid(self, user_id: str, max_age_minutes: int = 30) -> bool:
+    def is_session_valid(self, wallet_address: str, max_age_minutes: int = 30) -> bool:
         """
         Check if user has a valid MFA session
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
             max_age_minutes (int): Maximum session duration in minutes
         
         Returns:
             bool: True if session is valid, False otherwise
         """
-        if user_id not in self.verified_sessions:
+        if wallet_address not in self.verified_sessions:
             return False
         
-        session_time = self.verified_sessions[user_id]
+        session_time = self.verified_sessions[wallet_address]
         is_valid = datetime.now() - session_time < timedelta(minutes=max_age_minutes)
         
         # Optional: Clean up expired sessions
         if not is_valid:
-            del self.verified_sessions[user_id]
+            del self.verified_sessions[wallet_address]
         
         return is_valid
 
-    def reset_mfa(self, user_id: str) -> bool:
+    def reset_mfa(self, wallet_address: str) -> bool:
         """
         Reset MFA configuration for a user
         
         Args:
-            user_id (str): Unique identifier for the user
+            wallet_address (str): Unique identifier for the user
         
         Returns:
             bool: True if reset successful, False otherwise
         """
         try:
             # Remove secrets and sessions
-            if user_id in self.mfa_secrets:
-                del self.mfa_secrets[user_id]
+            if wallet_address in self.mfa_secrets:
+                del self.mfa_secrets[wallet_address]
             
-            if user_id in self.verified_sessions:
-                del self.verified_sessions[user_id]
+            if wallet_address in self.verified_sessions:
+                del self.verified_sessions[wallet_address]
             
             # Update persistent storage
             self._save_mfa_configs()
             
-            logger.info(f"MFA reset for user {user_id}")
+            logger.info(f"MFA reset for user {wallet_address}")
             return True
         except Exception as e:
-            logger.error(f"Error resetting MFA for user {user_id}: {e}")
+            logger.error(f"Error resetting MFA for user {wallet_address}: {e}")
             return False
