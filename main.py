@@ -10,7 +10,7 @@ import concurrent.futures
 from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
 import getpass
-from utils import find_available_port, init_rotation_manager, find_available_port_async, get_secure_password
+from utils import find_available_port, init_rotation_manager, find_available_port_async
 from gui import BlockchainGUI
 import threading
 import aiohttp
@@ -134,30 +134,56 @@ async def initialize_security(node_id: str) -> tuple:
     
     return security_monitor, mfa_manager, backup_manager
 
-def get_wallet_password(args):
-    """Get wallet password based on command line arguments"""
-    # Check for explicit password
-    if args.password:
-        return args.password
+async def get_wallet_password(blockchain: Blockchain):
+    """Get wallet password for existing wallet or create a new one."""
+    print("\n=== Wallet Connection ===")
+    choice = input("Do you want to connect to an existing wallet (1) or create a new one (2)? [1/2]: ").strip()
     
-    # Check for environment variable
-    if args.password_env:
-        password = os.environ.get("WALLET_PASSWORD")
-        if password:
+    if choice == "2":
+        # Create a new wallet
+        address = await blockchain.create_wallet()  # Generate new wallet
+        print(f"New wallet created with address: {address}")
+        while True:
+            password = getpass.getpass("Set a wallet encryption password: ").strip()
+            if not password:
+                print("Password cannot be empty. Please try again.")
+                continue
+            confirm = getpass.getpass("Confirm password: ").strip()
+            if password != confirm:
+                print("Passwords do not match. Please try again.")
+                continue
+            blockchain.key_manager.password = password  # Set the password
+            await blockchain.save_wallets()  # Save with new password
+            print("Wallet encrypted and saved successfully.")
             return password
-        else:
-            logger.warning("WALLET_PASSWORD environment variable requested but not set")
     
-    # Interactive prompt
-    if args.prompt_password:
+    # Existing wallet
+    if choice == "1":
+        while not password:
+            password = getpass.getpass("Enter wallet encryption password: ").strip()
+            print("Password cannot be empty. Please try again.")
+            continue
         try:
-            return getpass.getpass("Enter wallet encryption password: ")
+            # Temporarily set password and attempt to load keys
+            original_password = blockchain.key_manager.password
+            blockchain.key_manager.password = password
+            wallets = await blockchain.key_manager.load_keys()
+            if wallets:
+                print(f"Successfully connected to wallet(s). Found {len(wallets)} address(es).")
+                blockchain.wallets = wallets  # Update blockchain wallets
+                return password
+            else:
+                print("No wallets found with this password. Please try again or create a new wallet.")
+                blockchain.key_manager.password = original_password
+        except ValueError as e:
+            if "Incorrect password" in str(e):
+                print("Incorrect password. Please try again.")
+            else:
+                raise
         except Exception as e:
-            logger.error(f"Failed to get password from prompt: {e}")
+            logger.error(f"Error loading wallet: {e}")
+            raise
     
-    # Return None if no password was provided - KeyManager will use default
-    return None
-
 async def create_genesis_blockchain(node_id: str, wallet_password: str) -> Blockchain:
     """Initialize blockchain with genesis block"""
     # Create blockchain instance
@@ -227,13 +253,19 @@ async def async_main(args, loop):
         node_id = f"node{port}"
         logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
         
-        wallet_password = get_wallet_password(args)
+        # Initialize blockchain with default password first
+        blockchain = Blockchain(node_id=node_id, wallet_password=None)  # No password yet
+        
+        # Get wallet password and connect/create wallet
+        wallet_password = await get_wallet_password(blockchain)
+        blockchain.key_manager.password = wallet_password
+        
+        # Proceed with initialization
+        await blockchain.initialize()
 
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
         await init_rotation_manager(node_id)
         rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator, backup_manager=backup_manager)
-
-        blockchain = await create_genesis_blockchain(node_id, wallet_password)
         
         bootstrap_nodes = []
         if args.bootstrap:
@@ -259,13 +291,6 @@ def main():
     parser.add_argument("--port", type=int, default=None, help="Port to run the node on (1024-65535)")
     parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
     parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")
-    
-    # Add wallet password arguments
-    parser.add_argument("--password", type=str, help="Wallet encryption password")
-    parser.add_argument("--password-env", action="store_true", 
-                       help="Get password from WALLET_PASSWORD environment variable")
-    parser.add_argument("--prompt-password", action="store_true",
-                       help="Prompt for wallet password at startup")
     
     args = parser.parse_args()
 

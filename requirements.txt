@@ -8,6 +8,8 @@ base58>=2.1.1
 prometheus_client>=0.17.0
 
 # GUI Dependencies
+pyotp>=2.8.0
+qrcode>=7.3.1
 Pillow>=10.0.0  # For image handling in GUI
 
 # Utilities

@@ -1,8 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
-import tkinter.simpledialog
-import json
-import re
+from tkinter import ttk, messagebox, filedialog, simpledialog
 import time
 from queue import Queue
 from typing import Dict, List, Optional
@@ -13,10 +10,9 @@ import logging
 import asyncio
 from security import SecurityMonitor, MFAManager, KeyBackupManager
 import os
-from PIL import Image, ImageTk
+from PIL import ImageTk
 import queue
 import threading
-import datetime
 import gc
 import concurrent.futures
 
@@ -527,49 +523,150 @@ class BlockchainGUI:
     def update_wallet_dropdown(self):
         """Update the wallet dropdown with available addresses"""
         try:
-            # Define the async address fetch coroutine
+            # Use a future to manage the async operation
             async def fetch_addresses_coroutine():
                 try:
                     addresses = await self.blockchain.get_all_addresses()
+                    
+                    # Use thread-safe queue to update UI
                     self.update_queue.put(lambda: self.populate_wallet_dropdown(addresses))
                 except Exception as e:
                     logger.error(f"Address fetch exception: {str(e)}")
-                    self.update_queue.put(lambda: self.show_error(f"Failed to get wallet addresses: {str(e)}"))
+                    self.update_queue.put(
+                        lambda: self.show_error(f"Failed to get wallet addresses: {str(e)}")
+                    )
 
             # Run the coroutine in the event loop thread-safely
-            asyncio.run_coroutine_threadsafe(fetch_addresses_coroutine(), self.loop)
+            future = asyncio.run_coroutine_threadsafe(fetch_addresses_coroutine(), self.loop)
+
+            # Add a timeout handler to prevent blocking
+            def check_future():
+                try:
+                    # Check if the future is done
+                    if future.done():
+                        # If there's an exception, it will be raised here
+                        future.result(timeout=0)
+                    else:
+                        # If not done, schedule another check
+                        self.root.after(100, check_future)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Wallet address fetch timed out")
+                    self.update_queue.put(
+                        lambda: self.show_error("Wallet address fetch timed out")
+                    )
+                except Exception as e:
+                    logger.error(f"Wallet dropdown update error: {str(e)}")
+                    self.update_queue.put(
+                        lambda: self.show_error(f"Failed to update wallet dropdown: {str(e)}")
+                    )
+
+            # Start checking the future
+            self.root.after(100, check_future)
+
         except Exception as e:
-            self.show_error(f"Wallet dropdown update error: {str(e)}")
+            logger.error(f"Wallet dropdown update initialization error: {str(e)}")
+            self.show_error(f"Failed to initiate wallet dropdown update: {str(e)}")
 
     def populate_wallet_dropdown(self, addresses):
         """Populate the wallet dropdown with the given addresses"""
-        menu = self.wallet_dropdown["menu"]
-        menu.delete(0, "end")
-        
-        for address in addresses:
+        try:
+            # Clear existing menu items
+            menu = self.wallet_dropdown["menu"]
+            menu.delete(0, "end")
+            
+            # Add "Select Wallet" as default
+            self.selected_wallet.set("Select Wallet")
             menu.add_command(
-                label=address[:10] + "...",  # Show shortened address
-                command=lambda a=address: self.on_wallet_selected(a)
+                label="Select Wallet", 
+                command=lambda: self.selected_wallet.set("Select Wallet")
             )
+            
+            # Add wallet addresses
+            for address in addresses:
+                menu.add_command(
+                    label=address[:10] + "...",  # Show shortened address
+                    command=lambda a=address: self.on_wallet_selected(a)
+                )
+            
+            # Optional: Log the number of wallets found
+            logger.info(f"Populated wallet dropdown with {len(addresses)} addresses")
+        except Exception as e:
+            logger.error(f"Error populating wallet dropdown: {str(e)}")
+            self.show_error(f"Failed to populate wallet dropdown: {str(e)}")
 
     def on_wallet_selected(self, address):
         """Handle wallet selection with MFA verification"""
         try:
-            if self.mfa_manager and not self.verify_mfa():
-                messagebox.showerror("Error", "MFA verification failed")
+            logger.debug(f"Starting wallet selection for address: {address}")
+            
+            async def verify():
+                try:
+                    if self.mfa_manager:
+                        logger.debug("MFA manager present, attempting verification")
+                        verified = await self.verify_mfa()
+                        if not verified:
+                            logger.warning("MFA verification failed")
+                            self.update_queue.put(
+                                lambda: messagebox.showerror("Error", "MFA verification failed")
+                            )
+                            return False
+                        logger.debug("MFA verification successful")
+                    return True
+                except Exception as e:
+                    logger.error(f"Error in verify coroutine: {str(e)}", exc_info=True)
+                    return False
+
+            # Run the verification coroutine and get the result
+            logger.debug("Running verification coroutine")
+            verification_future = asyncio.run_coroutine_threadsafe(verify(), self.loop)
+            try:
+                if not verification_future.result(timeout=15):  # Increased timeout to allow for user input
+                    logger.warning("Verification failed")
+                    return
+            except concurrent.futures.TimeoutError:
+                logger.warning("Verification timed out - consider checking MFA configuration")
+                # Optionally provide a fallback or retry mechanism
                 return
-                
+            except Exception as e:
+                logger.error(f"Error getting verification result: {str(e)}", exc_info=True)
+                return
+                    
+            logger.debug(f"Setting selected wallet to: {address}")
             self.selected_wallet.set(address)
             
             # Update balance and transaction history asynchronously
             async def update_wallet_info():
-                await self.update_async_balance(address)
-                await self.update_async_transaction_history(address)
+                try:
+                    logger.debug("Starting wallet info update")
+                    await self.update_async_balance(address)
+                    await self.update_async_transaction_history(address)
+                    logger.debug("Wallet info update completed")
+                except Exception as e:
+                    logger.error(f"Error updating wallet info: {str(e)}", exc_info=True)
+                    self.update_queue.put(
+                        lambda: messagebox.showerror("Error", f"Failed to update wallet information: {str(e)}")
+                    )
             
-            asyncio.run_coroutine_threadsafe(update_wallet_info(), self.loop)
+            logger.debug("Scheduling wallet info update")
+            update_future = asyncio.run_coroutine_threadsafe(update_wallet_info(), self.loop)
             
+            # Add a callback to handle any errors in the update
+            def handle_update_done(future):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Wallet info update failed: {str(e)}", exc_info=True)
+                    self.update_queue.put(
+                        lambda: messagebox.showerror("Error", f"Failed to update wallet information: {str(e)}")
+                    )
+            
+            update_future.add_done_callback(handle_update_done)
+                
         except Exception as e:
-            messagebox.showerror("Error", f"Error selecting wallet: {str(e)}")
+            logger.error(f"Error in wallet selection: {str(e)}", exc_info=True)
+            self.update_queue.put(
+                lambda: messagebox.showerror("Error", f"Error selecting wallet: {str(e)}")
+            )
 
     def prompt_password(self, title: str, message: str) -> str:
         """Prompt user for a password"""
@@ -583,51 +680,101 @@ class BlockchainGUI:
 
     def handle_change_password(self):
         """Handle password change button click"""
-        # First verify MFA if enabled
-        if self.mfa_manager and not self.verify_mfa():
-            self.show_error("MFA verification required to change password")
-            return
+        try:
+            async def verify_and_change():
+                # Verify MFA if enabled
+                if self.mfa_manager:
+                    if not await self.verify_mfa():
+                        self.update_queue.put(
+                            lambda: self.show_error("MFA verification required to change password")
+                        )
+                        return
 
-        # Get the old password
-        old_password = self.prompt_password("Current Password", "Enter current wallet password:")
-        if not old_password:
-            return
+                # Prompt and verify old password first
+                old_password = self.prompt_password("Current Password", "Enter current wallet password:")
+                if not old_password:
+                    return
 
-        # Get the new password
-        new_password = self.prompt_password("New Password", "Enter new wallet password:")
-        if not new_password:
-            return
+                # Explicitly test the old password
+                try:
+                    # Temporarily set KeyManager password to test decryption
+                    original_password = self.blockchain.key_manager.password
+                    self.blockchain.key_manager.password = old_password
+                    await self.blockchain.key_manager.load_keys()  # Will raise if incorrect
+                    self.blockchain.key_manager.password = original_password  # Restore on success
+                except ValueError as e:
+                    if "Incorrect password" in str(e):
+                        self.update_queue.put(
+                            lambda: self.show_error("Incorrect current password")
+                        )
+                    else:
+                        self.update_queue.put(
+                            lambda: self.show_error(f"Password verification failed: {str(e)}")
+                        )
+                    return
 
-        # Confirm the new password
-        confirm_password = self.prompt_password("Confirm Password", "Confirm new wallet password:")
-        if not confirm_password:
-            return
-            
-        # Create task to change password
-        self.loop.create_task(self.change_wallet_password(old_password, new_password))
+                # Prompt for new password
+                new_password = self.prompt_password("New Password", "Enter new wallet password:")
+                if not new_password:
+                    return
 
-    def verify_mfa(self):
+                # Confirm new password
+                confirm_password = self.prompt_password("Confirm Password", "Confirm new wallet password:")
+                if new_password != confirm_password:
+                    self.update_queue.put(
+                        lambda: self.show_error("Confirmed password does not match new password")
+                    )
+                    return
+
+                # Change the password
+                await self.blockchain.change_wallet_password(new_password)
+
+                self.update_queue.put(
+                    lambda: messagebox.showinfo("Success", "Password changed successfully")
+                )
+
+            asyncio.run_coroutine_threadsafe(verify_and_change(), self.loop)
+        except Exception as e:
+            self.show_error(f"Error initiating password change: {str(e)}")
+
+    async def verify_mfa(self):
         """Verify MFA code if enabled"""
         if not self.mfa_manager:
             return True
             
-        code = simpledialog.askstring("MFA Required", "Enter MFA code:", show='*')
-        if not code:
-            return False
-            
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self.mfa_manager.verify_mfa(self.network.node_id, code),
-                self.loop
-            )
-            result = future.result(timeout=5)
-            if result:
-                logger.info("MFA verification successful")
-            else:
-                logger.warning("MFA verification failed")
+            # Check if MFA is configured for this node
+            is_configured = await self.mfa_manager.is_mfa_configured(self.network.node_id)
+            if not is_configured:
+                logger.info(f"MFA not configured for node {self.network.node_id}, skipping verification")
+                return True
+                
+            # Create a Future to store the result
+            code_future = asyncio.Future()
+            
+            # Function to run in main thread to get the code
+            def get_code():
+                try:
+                    code = simpledialog.askstring("MFA Required", "Enter MFA code:", show='*', parent=self.root)
+                    self.loop.call_soon_threadsafe(lambda: code_future.set_result(code if code else None))
+                except Exception as e:
+                    logger.error(f"Error getting MFA code: {e}")
+                    self.loop.call_soon_threadsafe(lambda: code_future.set_result(None))
+            
+            # Schedule the dialog in the main thread
+            self.update_queue.put(get_code)
+            
+            # Wait for the result
+            code = await code_future
+            if not code:
+                return False
+                
+            # Verify the code - make sure this returns a value, not a coroutine
+            result = await self.mfa_manager.verify_mfa(self.network.node_id, code)
+            logger.info(f"MFA verification {'successful' if result else 'failed'}")
             return result
         except Exception as e:
-            logger.error(f"MFA verification error: {e}")
+            logger.error(f"MFA verification error: {e}", exc_info=True)
             return False
 
     async def update_async_balance(self, address):
@@ -681,70 +828,76 @@ class BlockchainGUI:
     def send_transaction(self):
         """Send a transaction with security checks"""
         try:
-            # Verify MFA before transaction
-            if self.mfa_manager and not self.verify_mfa():
-                messagebox.showerror("Error", "MFA verification required")
-                return
-                
-            sender = self.selected_wallet.get()
-            recipient = self.recipient_var.get()
-            
-            try:
-                amount = float(self.amount_var.get())
-            except ValueError:
-                messagebox.showerror("Error", "Invalid amount")
-                return
-                
-            if sender and recipient and amount > 0:
-                # Get sender's wallet info
-                async def send_transaction_async():
-                    try:
-                        wallet = await self.blockchain.get_wallet(sender)
-                        if not wallet:
-                            self.update_queue.put(lambda: messagebox.showerror("Error", "Wallet not found"))
-                            return
-                            
-                        # Create and send transaction
-                        tx = await self.blockchain.create_transaction(
-                            wallet['private_key'],
-                            sender,
-                            recipient,
-                            amount,
-                            fee=0.001
+            async def verify_and_send():
+                # Verify MFA before transaction
+                if self.mfa_manager:
+                    if not await self.verify_mfa():
+                        self.update_queue.put(
+                            lambda: messagebox.showerror("Error", "MFA verification failed")
                         )
-                        
-                        if not tx:
-                            self.update_queue.put(lambda: messagebox.showerror("Error", "Failed to create transaction"))
-                            return
-                            
-                        # Add to mempool
-                        success = await self.blockchain.add_transaction_to_mempool(tx)
-                        
-                        if success:
-                            # Backup keys after transaction if enabled
-                            if self.backup_manager:
-                                await self.backup_manager.backup_transaction(tx)
-                            
-                            self.update_queue.put(lambda: messagebox.showinfo("Success", "Transaction sent successfully"))
-                            
-                            # Clear inputs and update display
-                            self.update_queue.put(lambda: self.amount_var.set(""))
-                            self.update_queue.put(lambda: self.recipient_var.set(""))
-                            
-                            # Update balance and transaction history
-                            await self.update_async_balance(sender)
-                            await self.update_async_transaction_history(sender)
-                        else:
-                            self.update_queue.put(lambda: messagebox.showerror("Error", "Transaction rejected by mempool"))
-                    except Exception as e:
-                        logger.error(f"Transaction send error: {str(e)}")
-                        self.update_queue.put(lambda: messagebox.showerror("Error", f"Transaction failed: {str(e)}"))
+                        return
+
+                sender = self.selected_wallet.get()
+                recipient = self.recipient_var.get()
                 
-                # Run the transaction in the event loop
-                asyncio.run_coroutine_threadsafe(send_transaction_async(), self.loop)
-            else:
-                messagebox.showerror("Error", "Please fill all fields correctly")
+                try:
+                    amount = float(self.amount_var.get())
+                except ValueError:
+                    messagebox.showerror("Error", "Invalid amount")
+                    return
+                    
+                if sender and recipient and amount > 0:
+                    # Get sender's wallet info
+                    async def send_transaction_async():
+                        try:
+                            wallet = await self.blockchain.get_wallet(sender)
+                            if not wallet:
+                                self.update_queue.put(lambda: messagebox.showerror("Error", "Wallet not found"))
+                                return
+                            
+                            # Create and send transaction
+                            tx = await self.blockchain.create_transaction(
+                                wallet['private_key'],
+                                sender,
+                                recipient,
+                                amount,
+                                fee=0.001
+                            )
+                            
+                            if not tx:
+                                self.update_queue.put(lambda: messagebox.showerror("Error", "Failed to create transaction"))
+                                return
+                            
+                            # Add to mempool
+                            success = await self.blockchain.add_transaction_to_mempool(tx)
+                            
+                            if success:
+                                # Backup keys after transaction if enabled
+                                if self.backup_manager:
+                                    await self.backup_manager.backup_transaction(tx)
+                                
+                                self.update_queue.put(lambda: messagebox.showinfo("Success", "Transaction sent successfully"))
+                                
+                                # Clear inputs and update display
+                                self.update_queue.put(lambda: self.amount_var.set(""))
+                                self.update_queue.put(lambda: self.recipient_var.set(""))
+                                
+                                # Update balance and transaction history
+                                await self.update_async_balance(sender)
+                                await self.update_async_transaction_history(sender)
+                            else:
+                                self.update_queue.put(lambda: messagebox.showerror("Error", "Transaction rejected by mempool"))
+                        except Exception as e:
+                            logger.error(f"Transaction send error: {str(e)}")
+                            self.update_queue.put(lambda: messagebox.showerror("Error", f"Transaction failed: {str(e)}"))
+                    
+                    # Run the transaction in the event loop
+                    asyncio.run_coroutine_threadsafe(send_transaction_async(), self.loop)
+                else:
+                    messagebox.showerror("Error", "Please fill all fields correctly")
                 
+            # Run the verification and transaction coroutine
+            asyncio.run_coroutine_threadsafe(verify_and_send(), self.loop)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to send transaction: {str(e)}")
 

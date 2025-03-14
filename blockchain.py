@@ -871,6 +871,7 @@ class AsyncMiner:
             # Update last values for next calculation
             self.last_hash_count = self.total_hashes
             self.last_hash_time = current_time
+            self.stats['hashrate'] = hashrate
             return hashrate
         return 0.0
 
@@ -987,11 +988,10 @@ class NetworkService:
         except Exception as e:
             logger.error(f"Failed to handle chain request: {e}")
 
-from utils import get_secure_password
 class KeyManager:
     """Securely manages wallet keys with strong encryption"""
     def __init__(self, password: str = None):
-        self.password = get_secure_password(password)
+        self.password = password
         self.keystore_path = "keys.encrypted"
         self.salt = None
         self.load_salt()
@@ -1062,29 +1062,27 @@ class KeyManager:
     
     async def load_keys(self) -> dict:
         """Load and decrypt wallet keys from storage"""
-        try:
-            if not os.path.exists(self.keystore_path):
-                logger.info(f"No existing key store found at {self.keystore_path}")
-                return {}
-            
-            with open(self.keystore_path, "r") as f:
-                encrypted_wallets = json.load(f)
-            
-            # Decrypt wallet data
-            wallets = {}
-            for address, data in encrypted_wallets.items():
-                encrypted_key = base64.b64decode(data['encrypted_private_key'])
-                private_key = self.decrypt_private_key(encrypted_key)
-                wallets[address] = {
-                    'public_key': data['public_key'],
-                    'private_key': private_key
-                }
-            
-            logger.info(f"Loaded {len(wallets)} encrypted wallets from {self.keystore_path}")
-            return wallets
-        except Exception as e:
-            logger.error(f"Failed to load encrypted keys: {e}")
+        if not os.path.exists(self.keystore_path):
+            logger.info(f"No existing key store found at {self.keystore_path}")
             return {}
+        
+        with open(self.keystore_path, "r") as f:
+            encrypted_wallets = json.load(f)
+        
+        wallets = {}
+        for address, data in encrypted_wallets.items():
+            encrypted_key = base64.b64decode(data['encrypted_private_key'])
+            try:
+                private_key = self.decrypt_private_key(encrypted_key)
+            except Exception as e:
+                raise ValueError("Incorrect password for wallet decryption") from e
+            wallets[address] = {
+                'public_key': data['public_key'],
+                'private_key': private_key
+            }
+        
+        logger.info(f"Loaded {len(wallets)} encrypted wallets from {self.keystore_path}")
+        return wallets
         
     async def change_password(self, new_password: str) -> bool:
         """Change the encryption password and re-encrypt all keys"""
@@ -1321,35 +1319,36 @@ class Blockchain:
     # Update the wallet handling methods in Blockchain class
 
     async def load_wallets(self):
-        """Load wallets from secure storage"""
         try:
-            # First try to load from encrypted storage
-            encrypted_wallets = await self.key_manager.load_keys()
-            if encrypted_wallets:
-                self.wallets = encrypted_wallets
+            self.wallets = await self.key_manager.load_keys()
+            if self.wallets:
                 logger.info(f"Loaded {len(self.wallets)} wallets from encrypted storage")
                 return
-            
-            # Fall back to database if no encrypted storage
-            async with aiosqlite.connect(self.storage_path) as db:
-                async with db.execute('SELECT address, public_key, private_key FROM wallets') as cursor:
-                    rows = await cursor.fetchall()
-                    for row in rows:
-                        address, public_key, private_key = row
-                        self.wallets[address] = {
-                            'public_key': public_key,
-                            'private_key': private_key
-                        }
-                    logger.info(f"Loaded {len(self.wallets)} wallets from database")
-                    
-                    # Migrate to encrypted storage if wallets were loaded from database
-                    if self.wallets:
-                        await self.key_manager.save_keys(self.wallets)
-                        logger.info("Migrated wallet keys to encrypted storage")
-        except Exception as e:
-            logger.error(f"Failed to load wallets: {e}")
-            if "no such table" not in str(e):
+        except ValueError as e:
+            if "Incorrect password" in str(e):
+                raise ValueError("Incorrect wallet password provided") from e
+            else:
                 raise
+        
+        # If no encrypted wallets exist, load from database
+        async with aiosqlite.connect(self.storage_path) as db:
+            async with db.execute('SELECT address, public_key, private_key FROM wallets') as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    address, public_key, private_key = row
+                    self.wallets[address] = {
+                        'public_key': public_key,
+                        'private_key': private_key
+                    }
+                logger.info(f"Loaded {len(self.wallets)} wallets from database")
+                
+                # Migrate to encrypted storage and remove from database
+                if self.wallets:
+                    await self.key_manager.save_keys(self.wallets)
+                    logger.info("Migrated wallet keys to encrypted storage")
+                    await db.execute('DELETE FROM wallets')
+                    await db.commit()
+                    logger.info("Removed plain-text wallets from database")
 
     async def save_wallets(self):
         """Save wallets to secure storage"""
@@ -1547,7 +1546,7 @@ class Blockchain:
                     await self.save_chain()
                     
                     # Update metrics
-                    self.update_metrics()
+                    await self.update_metrics()
                     
                     # Process any orphan blocks that might now fit
                     await self._process_orphans()
@@ -1586,7 +1585,7 @@ class Blockchain:
                         await self.utxo_set.update_with_block(orphan)
                         self.trigger_event("new_block", orphan)
                         await self.save_chain()
-                        self.update_metrics()
+                        await self.update_metrics()
                         del self.orphans[hash]
                         # Recursively process any additional orphans
                         await self._process_orphans()
@@ -1719,7 +1718,7 @@ class Blockchain:
                 await self.save_chain()
                 
                 # Update metrics
-                self.update_metrics()
+                await self.update_metrics()
                 
                 return True
                 
@@ -2186,17 +2185,17 @@ class BlockchainNode:
             return
             
         try:
-            # Initialize blockchain first
             await self.blockchain.initialize()
-            
-            # Start resource monitor
             await self.resource_monitor.start()
-            
             self.is_running = True
             logger.info("BlockchainNode started successfully")
-        except Exception as e:
-            logger.error(f"Failed to start BlockchainNode: {e}")
-            raise
+        except ValueError as e:
+            if "Incorrect wallet password" in str(e):
+                logger.error("Incorrect wallet password provided. Please check your password and try again.")
+                sys.exit(1)
+            else:
+                logger.error(f"Failed to start BlockchainNode: {e}")
+                raise
 
     async def stop(self):
         """Stop all services gracefully"""
