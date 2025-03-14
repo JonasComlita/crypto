@@ -192,22 +192,6 @@ def is_port_available(port: int, host: str = 'localhost') -> bool:
         logger.warning(f"Error checking port {port} availability: {e}")
         return False
 
-def find_available_port(start_port: int = 1024, end_port: int = 65535, host: str = 'localhost') -> int:
-    """Find an available port within a range."""
-    try:
-        port = random.randint(start_port, end_port)
-        attempts = 0
-        max_attempts = 100  # Prevent infinite loops
-        while not is_port_available(port, host) and attempts < max_attempts:
-            port = random.randint(start_port, end_port)
-            attempts += 1
-        if attempts >= max_attempts:
-            raise RuntimeError(f"No available port found between {start_port} and {end_port}")
-        return port
-    except Exception as e:
-        logger.error(f"Failed to find available port: {e}")
-        raise
-
 async def find_available_port_async(start_port: int = 1024, end_port: int = 65535, host: str = 'localhost') -> int:
     """Find an available port asynchronously"""
     try:

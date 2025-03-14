@@ -123,7 +123,7 @@ class BlockchainNetwork:
         self.bootstrap_nodes = bootstrap_nodes or []
         self.security_monitor = security_monitor
         self.shutdown_flag = False
-        self.loop = None or asyncio.get_event_loop()
+        self.loop = None
         self.private_key, self.public_key = generate_node_keypair()
         self.peers = {}
         self.app = web.Application(middlewares=[rate_limit_middleware])
@@ -142,15 +142,21 @@ class BlockchainNetwork:
         self.mfa_manager = MFAManager()
         self.server = None  # Store server instance for cleanup
         self.health_server = None
-        self.runner = None  # Add runner for proper web app handling
+        self.runner = web.AppRunner(self.app)  # Add runner for proper web app handling
         
         # Initialize SSL contexts
         self.ssl_context = None
         self.client_ssl_context = None
-        self.init_ssl()
+        if self.port is not None:  # Only init_ssl if port is set
+            self.init_ssl()
+        logger.info(f"BlockchainNetwork initialized with port: {self.port}")
 
     def init_ssl(self):
         """Initialize SSL contexts"""
+        if self.port is None:
+            logger.warning(f"Skipping SSL initialization for {self.node_id} as port is None")
+            return
+
         # Client SSL context
         self.client_ssl_context = ssl.create_default_context()
         self.client_ssl_context.check_hostname = False
@@ -224,6 +230,7 @@ class BlockchainNetwork:
 
     async def start(self):
         """Start the network and security monitoring"""
+        self.loop = asyncio.get_event_loop()
         # Initialize KeyRotationManager if not already done
         from utils import init_rotation_manager, rotation_manager
         if not rotation_manager:
@@ -602,6 +609,11 @@ class BlockchainNetwork:
 
     async def start_periodic_sync(self) -> asyncio.Task:
         """Start periodic sync and discovery tasks."""
+        self.loop = asyncio.get_event_loop()
+        if self.port is None:
+            raise ValueError(f"Cannot start network: port is None for node {self.node_id}")
+        if self.ssl_context is None:
+            self.init_ssl()  # Ensure SSL is set before starting
         if self.shutdown_flag:
             return
         
@@ -729,7 +741,8 @@ class BlockchainNetwork:
     async def start_health_server(self):
         """Start the health check HTTP server"""
         try:
-            self.runner = web.AppRunner(self.app)
+            if self.port is None:
+                raise ValueError(f"Cannot start health server: port is None for node {self.node_id}")
             await self.runner.setup()
             site = web.TCPSite(self.runner, self.host, self.port + 1)
             await site.start()
@@ -740,6 +753,8 @@ class BlockchainNetwork:
 
     async def start_server(self):
         """Start both P2P and HTTP servers"""
+        if self.loop is None:
+            self.loop = asyncio.get_event_loop()
         try:
             # Start P2P server
             self.server = await asyncio.start_server(

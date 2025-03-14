@@ -770,7 +770,7 @@ class BlockchainGUI:
                 return False
                 
             # Verify the code - make sure this returns a value, not a coroutine
-            result = await self.mfa_manager.verify_mfa(self.network.node_id, code)
+            result = self.mfa_manager.verify_mfa(self.network.node_id, code)
             logger.info(f"MFA verification {'successful' if result else 'failed'}")
             return result
         except Exception as e:

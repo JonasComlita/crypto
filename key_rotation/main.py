@@ -12,7 +12,7 @@ from key_rotation.api import create_rotation_api
 logger = logging.getLogger(__name__)
 
 async def main(node_id: Optional[str] = None, is_validator: bool = False, 
-              port: int = 5000, host: str = "127.0.0.1", loop=None, shutdown_event: Optional[asyncio.Event] = None) -> None:
+              port: Optional[int] = None, host: str = "127.0.0.1", loop=None, shutdown_event: Optional[asyncio.Event] = None) -> None:
     load_dotenv()
     node_id = node_id or os.getenv("NODE_ID") or str(uuid.uuid4())
     is_validator = is_validator or (os.getenv("IS_VALIDATOR", "false").lower() == "true")

@@ -1111,9 +1111,10 @@ class KeyManager:
 
 class Blockchain:
     def __init__(self, mfa_manager=None, backup_manager=None, storage_path: str = "chain.db", 
-                 node_id=None, wallet_password: str = None):
+                 node_id=None, wallet_password: str = None, port: Optional[int] = None):
         """Initialize blockchain"""
         from network import BlockchainNetwork
+        from utils import find_available_port_async
     
         # Initialization flag
         self.initialized = False
@@ -1139,11 +1140,15 @@ class Blockchain:
         
         # Event system
         self.listeners = {"new_block": [], "new_transaction": []}
+
+        # Store port as provided (or None initially)
+        self.port = port
+        logger.info(f"Blockchain initialized with port: {self.port}")
         
         # Networking
         self.node_id = node_id or "default"
         self.network_service = NetworkService()
-        self.network = BlockchainNetwork(self, self.node_id, "127.0.0.1", 5000)
+        self.network = BlockchainNetwork(self, self.node_id, "127.0.0.1", port)
         self.network_service.network = self.network
         self.network_service.blockchain = self
         
@@ -1197,6 +1202,16 @@ class Blockchain:
                 ''')
                 await db.commit()
                 logger.info("Database initialized")
+
+            # Set port if not provided
+            if self.port is None:
+                self.port = await self._port_finder(1024, 65535)
+                logger.info(f"Assigned port {self.port} to blockchain")
+            self.node_id = f"node{self.port}"  # Update node_id with port
+
+            self.network.node_id = self.node_id
+            self.network.port = self.port
+            logger.info(f"Updated BlockchainNetwork with node_id: {self.node_id}, port: {self.port}")
             
             # Load existing chain
             await self.load_chain()
@@ -2157,12 +2172,14 @@ class ResourceMonitor:
 class BlockchainNode:
     def __init__(self, wallet_password: str = None):
         """Initialize a blockchain node with all services"""
-
         # Create blockchain instance
         self.blockchain = Blockchain(
-            node_id=f"node-{int(time.time())}",
-            wallet_password=wallet_password
-            )
+            node_id=f"node-{self.port}",
+            wallet_password=wallet_password,
+        )
+
+        # Log the assigned port
+        logger.info(f"BlockchainNode using port: {self.blockchain.port}")
         
         # Create resource monitor
         self.resource_monitor = ResourceMonitor(self.blockchain)

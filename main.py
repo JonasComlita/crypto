@@ -10,7 +10,7 @@ import concurrent.futures
 from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
 import getpass
-from utils import find_available_port, init_rotation_manager, find_available_port_async
+from utils import init_rotation_manager, find_available_port_async
 from gui import BlockchainGUI
 import threading
 import aiohttp
@@ -134,55 +134,64 @@ async def initialize_security(node_id: str) -> tuple:
     
     return security_monitor, mfa_manager, backup_manager
 
-async def get_wallet_password(blockchain: Blockchain):
-    """Get wallet password for existing wallet or create a new one."""
+def get_wallet_password_synchronous(blockchain: Blockchain) -> str:
+    """Synchronously get wallet password for existing wallet or create a new one."""
     print("\n=== Wallet Connection ===")
     choice = input("Do you want to connect to an existing wallet (1) or create a new one (2)? [1/2]: ").strip()
     
     if choice == "2":
-        # Create a new wallet
-        address = await blockchain.create_wallet()  # Generate new wallet
-        print(f"New wallet created with address: {address}")
+        # Create a new wallet synchronously (using run_until_complete)
+        loop = asyncio.new_event_loop()
+        try:
+            address = loop.run_until_complete(blockchain.create_wallet())
+            print(f"New wallet created with address: {address}")
+            while True:
+                password = getpass.getpass("Set a wallet encryption password: ").strip()
+                if not password:
+                    print("Password cannot be empty. Please try again.")
+                    continue
+                confirm = getpass.getpass("Confirm password: ").strip()
+                if password != confirm:
+                    print("Passwords do not match. Please try again.")
+                    continue
+                blockchain.key_manager.password = password
+                loop.run_until_complete(blockchain.save_wallets())
+                print("Wallet encrypted and saved successfully.")
+                return password
+        finally:
+            loop.close()
+    
+    elif choice == "1":
         while True:
-            password = getpass.getpass("Set a wallet encryption password: ").strip()
+            password = getpass.getpass("Enter wallet encryption password: ").strip()
             if not password:
                 print("Password cannot be empty. Please try again.")
                 continue
-            confirm = getpass.getpass("Confirm password: ").strip()
-            if password != confirm:
-                print("Passwords do not match. Please try again.")
-                continue
-            blockchain.key_manager.password = password  # Set the password
-            await blockchain.save_wallets()  # Save with new password
-            print("Wallet encrypted and saved successfully.")
-            return password
-    
-    # Existing wallet
-    if choice == "1":
-        while not password:
-            password = getpass.getpass("Enter wallet encryption password: ").strip()
-            print("Password cannot be empty. Please try again.")
-            continue
-        try:
-            # Temporarily set password and attempt to load keys
-            original_password = blockchain.key_manager.password
-            blockchain.key_manager.password = password
-            wallets = await blockchain.key_manager.load_keys()
-            if wallets:
-                print(f"Successfully connected to wallet(s). Found {len(wallets)} address(es).")
-                blockchain.wallets = wallets  # Update blockchain wallets
-                return password
-            else:
-                print("No wallets found with this password. Please try again or create a new wallet.")
-                blockchain.key_manager.password = original_password
-        except ValueError as e:
-            if "Incorrect password" in str(e):
-                print("Incorrect password. Please try again.")
-            else:
+            loop = asyncio.new_event_loop()
+            try:
+                original_password = blockchain.key_manager.password
+                blockchain.key_manager.password = password
+                wallets = loop.run_until_complete(blockchain.key_manager.load_keys())
+                if wallets:
+                    print(f"Successfully connected to wallet(s). Found {len(wallets)} address(es).")
+                    blockchain.wallets = wallets
+                    return password
+                else:
+                    print("No wallets found with this password. Please try again or create a new wallet.")
+                    blockchain.key_manager.password = original_password
+            except ValueError as e:
+                if "Incorrect password" in str(e):
+                    print("Incorrect password. Please try again.")
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"Error loading wallet: {e}")
                 raise
-        except Exception as e:
-            logger.error(f"Error loading wallet: {e}")
-            raise
+            finally:
+                loop.close()
+    else:
+        print("Invalid choice. Please enter 1 or 2.")
+        return get_wallet_password_synchronous(blockchain)
     
 async def create_genesis_blockchain(node_id: str, wallet_password: str) -> Blockchain:
     """Initialize blockchain with genesis block"""
@@ -246,34 +255,25 @@ def run_async_loop(loop):
             logger.error(f"Error closing loop: {e}")
 
 
-async def async_main(args, loop):
+async def async_main(args, loop, wallet_password: str):
     try:
-        port = args.port if args.port else await find_available_port_async()
+        port = await find_available_port_async()
         api_port = port + 1000
         node_id = f"node{port}"
         logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
         
         # Initialize blockchain with default password first
-        blockchain = Blockchain(node_id=node_id, wallet_password=None)  # No password yet
+        blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=port)  # No password yet
         
-        # Get wallet password and connect/create wallet
-        wallet_password = await get_wallet_password(blockchain)
-        blockchain.key_manager.password = wallet_password
-        
-        # Proceed with initialization
-        await blockchain.initialize()
+        bootstrap_nodes = []
 
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
         await init_rotation_manager(node_id)
         rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator, backup_manager=backup_manager)
         
-        bootstrap_nodes = []
-        if args.bootstrap:
-            bootstrap_nodes = [(node.split(":")[0], int(node.split(":")[1])) for node in args.bootstrap.split(",")]
-        
         network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, bootstrap_nodes, security_monitor=security_monitor)
         network.loop = loop
-        await network.start_server()
+        await network.start()
         
         await rotation_manager.start()
         from key_rotation.main import main as rotation_main
@@ -301,8 +301,16 @@ def main():
         logger.error("Invalid bootstrap nodes format")
         sys.exit(1)
 
-    # Create the loop and start it in a separate thread
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Create blockchain instance for wallet setup
+    blockchain = Blockchain(node_id=f"node_temp", wallet_password=None, port=args.port)
+    
+    # Get wallet password synchronously before starting async loop
+    wallet_password = get_wallet_password_synchronous(blockchain)
+
+    # Create the loop and start it in a separate thread
     async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
     async_thread.start()
     
@@ -315,7 +323,7 @@ def main():
     
     try:
         # Initialize the application
-        init_future = asyncio.run_coroutine_threadsafe(async_main(args, loop), loop)
+        init_future = asyncio.run_coroutine_threadsafe(async_main(args, loop, wallet_password), loop)
         components = init_future.result(timeout=30)
         blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event = components
         
