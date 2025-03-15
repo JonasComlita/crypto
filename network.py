@@ -204,15 +204,11 @@ class BlockchainNetwork:
             logger.warning(f"Running without HTTPS for {self.node_id} on port {self.port} due to SSL failure")
             self.ssl_context = None
 
-    def setup_routes(self):
-        """Setup API routes"""
-        self.app.router.add_get('/health', self.health_check_endpoint)
-
     async def health_check_endpoint(self, request):
         """Health check endpoint"""
         return web.Response(text="OK", status=200)
 
-    def _setup_routes(self) -> None:
+    def setup_routes(self) -> None:
         """Configure HTTP routes for the network."""
         self.app.add_routes([
             web.get("/health", self.health_handler),
@@ -229,21 +225,37 @@ class BlockchainNetwork:
         return web.Response(status=200, text="OK")
 
     async def start(self):
-        """Start the network and security monitoring"""
+        """Start the network with automatic synchronization"""
         self.loop = asyncio.get_event_loop()
-        # Initialize KeyRotationManager if not already done
+        # Initialize key rotation manager if needed
         from utils import init_rotation_manager, rotation_manager
         if not rotation_manager:
             await init_rotation_manager(self.node_id)
-            logger.info(f"Initialized KeyRotationManager for node {self.node_id} in network start")
+            logger.info(f"Initialized KeyRotationManager for node {self.node_id}")
 
         # Start security monitoring if available
         if self.security_monitor:
             asyncio.create_task(self.security_monitor.analyze_patterns())
 
-        # Start the server and sync tasks
+        # Start the server tasks
         self.server_task_handle = asyncio.create_task(self.start_server())
-        logger.info("Network service started")
+
+        # Connect to bootstrap nodes
+        for host, port in self.bootstrap_nodes:
+            if (host, port) != (self.host, self.port):  # Don't connect to self
+                peer_id = f"node{port}"
+                logger.info(f"Connecting to bootstrap node {peer_id} at {host}:{port}")
+                auth_secret = await PEER_AUTH_SECRET()
+                await self.add_peer(peer_id, host, port, auth_secret)
+        
+        # Start peer discovery
+        asyncio.create_task(self.discover_peers())
+        
+        # Start periodic chain synchronization
+        self.sync_task = await self.start_periodic_sync(interval=10)  # Sync every 10 seconds
+        logger.info("Network service started with periodic chain synchronization every 30 seconds")
+        
+        logger.info("Network service started with automatic chain synchronization")
 
     def run(self):
         logger.info(f"Starting network server on {self.host}:{self.port}")
@@ -276,10 +288,6 @@ class BlockchainNetwork:
     async def send_with_retry(self, url: str, data: dict, method: str = "post", 
                             max_retries: int = CONFIG["max_retries"]) -> Tuple[bool, Optional[dict]]:
         """Send HTTP request with retry logic."""
-        from utils import rotation_manager
-        if rotation_manager is None:
-            logger.error("Rotation manager not initialized in send_with_retry")
-            return False, None
         # Get auth secret asynchronously
         auth_secret = await PEER_AUTH_SECRET()
         headers = {"Authorization": f"Bearer {auth_secret}"}
@@ -311,7 +319,9 @@ class BlockchainNetwork:
         """Broadcast a block to all connected peers."""
         with self.lock:
             tasks = []
-            for peer_id, (host, port, _) in self.peers.items():
+            for peer_id, peer_data in self.peers.items():
+                host = peer_data["host"]
+                port = peer_data["port"]
                 tasks.append(self.send_block(peer_id, host, port, block))
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for peer_id, result in zip(self.peers.keys(), results):
@@ -351,7 +361,9 @@ class BlockchainNetwork:
         """Thread-safe transaction broadcast"""
         with self.lock:
             tasks = []
-            for peer_id, (host, port, _) in self.peers.items():
+            for peer_id, peer_data in self.peers.items():
+                host = peer_data["host"]
+                port = peer_data["port"]
                 tasks.append(self.send_transaction(peer_id, host, port, transaction))
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for peer_id, result in zip(self.peers.keys(), results):
@@ -404,7 +416,9 @@ class BlockchainNetwork:
                 logger.warning(f"Cannot send chain to unknown peer {peer_id}")
                 return
 
-            host, port, _ = self.peers[peer_id]
+            peer_data = self.peers[peer_id]
+            host = peer_data["host"]
+            port = peer_data["port"]
             url = f"https://{host}:{port}/receive_chain"
             data = {"chain": chain_data}
             
@@ -440,7 +454,10 @@ class BlockchainNetwork:
         """Save current peers to persistent storage."""
         try:
             with open("known_peers.txt", "w") as f:
-                for peer_id, (host, port, pubkey) in self.peers.items():
+                for peer_id, peer_data in self.peers.items():
+                    host = peer_data["host"]
+                    port = peer_data["port"]
+                    pubkey = peer_data.get("public_key", "")
                     f.write(f"{host}:{port}:{pubkey}\n")
         except Exception as e:
             logger.error(f"Failed to save peers: {e}")
@@ -587,33 +604,82 @@ class BlockchainNetwork:
                 self._save_peers()
             del self.peer_failures[peer_id]
 
-    async def request_chain(self) -> None:
-        """Request and potentially update the blockchain from peers."""
-        best_chain = self.blockchain.chain
-        best_difficulty = self.blockchain.get_total_difficulty()
-        with self.lock:
-            tasks = []
-            for peer_id, (host, port, _) in self.peers.items():
-                url = f"https://{host}:{port}/get_chain"
-                tasks.append(self.send_with_retry(url, {}, method="get"))
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for peer_id, (success, chain_data) in zip(self.peers.keys(), results):
-                if not success or isinstance(chain_data, Exception):
-                    logger.warning(f"Failed to get chain from {peer_id}")
-                    self._increment_failure(peer_id)
-                    continue
+    async def request_chain(self):
+        """Request and potentially update the blockchain from peers with improved handling"""
+        try:
+            if not self.peers:
+                logger.debug("No peers available for chain request")
+                return
+                
+            logger.info("Requesting chain updates from peers")
+            our_chain_length = len(self.blockchain.chain)
+            our_chain_difficulty = self.blockchain.get_total_difficulty()
+            
+            # Track best chain
+            best_chain = None
+            best_difficulty = our_chain_difficulty
+            best_peer = None
+            
+            # Check chains from a random selection of peers to reduce network load
+            peer_items = list(self.peers.items())
+            random.shuffle(peer_items)
+            sample_size = min(3, len(peer_items))  # Check up to 3 random peers
+            
+            for peer_id, peer_data in peer_items[:sample_size]:
                 try:
+                    host = peer_data.get("host", "127.0.0.1")
+                    port = peer_data.get("port", 8000)
+                    url = f"https://{host}:{port}/get_chain"
+                    
+                    # Request the chain
+                    success, chain_data = await self.send_with_retry(url, {}, method="get")
+                    if not success or not chain_data:
+                        logger.warning(f"Failed to get chain from peer {peer_id}")
+                        continue
+                        
+                    # Convert to Block objects
                     new_chain = [Block.from_dict(block) for block in chain_data]
-                    new_difficulty = sum(block.header.difficulty for block in new_chain)
-                    if new_difficulty > best_difficulty and await self.blockchain.is_valid_chain(new_chain):
-                        best_chain = new_chain
-                        best_difficulty = new_difficulty
-                        logger.info(f"Found better chain from {peer_id} with difficulty {new_difficulty}")
-                        await self.blockchain.replace_chain(best_chain)
-                    self.peer_failures[peer_id] = 0
+                    if not new_chain:
+                        continue
+                        
+                    # Calculate difficulty and check if better than current best
+                    new_difficulty = sum(block.difficulty for block in new_chain)
+                    new_length = len(new_chain)
+                    
+                    logger.info(f"Peer {peer_id} has chain with length {new_length} and difficulty {new_difficulty}")
+                    logger.info(f"Our chain has length {our_chain_length} and difficulty {our_chain_difficulty}")
+                    
+                    if new_length > our_chain_length and new_difficulty > best_difficulty:
+                        # Validate the chain before accepting it
+                        if await self.blockchain.is_valid_chain(new_chain):
+                            best_chain = new_chain
+                            best_difficulty = new_difficulty
+                            best_peer = peer_id
+                            logger.info(f"Found better chain from peer {peer_id}: length={new_length}, difficulty={new_difficulty}")
                 except Exception as e:
-                    logger.warning(f"Invalid chain data from {peer_id}: {e}")
-                    self._increment_failure(peer_id)
+                    logger.error(f"Error requesting chain from peer {peer_id}: {e}", exc_info=True)
+            
+            # If we found a better chain, replace ours
+            if best_chain and len(best_chain) > our_chain_length:
+                logger.info(f"Replacing our chain (length={our_chain_length}) with chain from peer {best_peer} (length={len(best_chain)})")
+                if await self.blockchain.replace_chain(best_chain):
+                    logger.info(f"Successfully replaced chain with new chain of length {len(best_chain)}")
+                    
+                    # Force balances update in the UI by triggering events for the new blocks
+                    for i in range(our_chain_length, len(best_chain)):
+                        self.blockchain.trigger_event("new_block", best_chain[i])
+                    
+                    return True
+                else:
+                    logger.warning("Failed to replace chain with new chain from peer")
+            else:
+                logger.info("No better chain found from peers")
+            
+            return False
+        except Exception as e:
+            logger.error(f"Chain request error: {e}", exc_info=True)
+            return False
+
 
     async def sync_and_discover(self) -> None:
         """Perform a full sync and discovery cycle."""
@@ -636,41 +702,27 @@ class BlockchainNetwork:
                 logger.error(f"Periodic discovery error: {e}")
             await asyncio.sleep(CONFIG["peer_discovery_interval"])
 
-    async def start_periodic_sync(self) -> asyncio.Task:
-        """Start periodic sync and discovery tasks."""
-        self.loop = asyncio.get_event_loop()
-        if self.port is None:
-            raise ValueError(f"Cannot start network: port is None for node {self.node_id}")
-        if self.ssl_context is None:
-            self.init_ssl()  # Ensure SSL is set before starting
-        if self.shutdown_flag:
-            return
+    async def start_periodic_sync(self, interval=30):
+        """Start periodic chain synchronization"""
+        logger.info(f"Starting periodic chain sync with interval {interval} seconds")
         
         async def sync_loop():
-            logger.info("Starting periodic sync loop")
-            last_logged_state = None
+            """Run periodic sync loop"""
             while not self.shutdown_flag:
                 try:
-                    await self.discover_peers()
-                    current_state = "No peers" if not self.peers and not self.bootstrap_nodes else "Peers present"
-                    if current_state != last_logged_state:
-                        logger.info(current_state if current_state == "No peers" else "Peer sync completed")
-                        last_logged_state = current_state
-                    await asyncio.sleep(CONFIG["sync_interval"])
+                    # Request chain from peers
+                    await self.request_chain()
+                    # Wait for the specified interval
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    logger.info("Periodic sync loop cancelled")
+                    break
                 except Exception as e:
-                    logger.critical(f"Sync loop failed: {e}", exc_info=True)
-                    raise
-                finally:
-                    await asyncio.sleep(0.1)
+                    logger.error(f"Error in periodic sync: {e}", exc_info=True)
+                    await asyncio.sleep(5)  # Short delay before retry
         
-        asyncio.create_task(sync_loop())
-
-        if self.sync_task and not self.sync_task.done():
-            logger.warning("Sync task already running")
-            return self.sync_task
-        self.sync_task = self.loop.create_task(sync_loop())
-        self.sync_task.add_done_callback(self._handle_task_result)
-        return self.sync_task
+        # Start the loop as a background task
+        return asyncio.create_task(sync_loop())
 
     def _handle_task_result(self, task: asyncio.Task) -> None:
         """Handle task completion and log exceptions."""
@@ -726,9 +778,6 @@ class BlockchainNetwork:
                             break
                         
                         message_length = int.from_bytes(length_data, 'big')
-                        if message_length > 1048576:  # 1MB limit
-                            logger.warning(f"Message too large from {client_ip}")
-                            break
                         
                         # Read the actual message
                         data = await reader.read(message_length)
@@ -736,12 +785,14 @@ class BlockchainNetwork:
                             break
                         
                         try:
-                            # Try to decode as JSON
+                            # Decode as JSON
                             message = json.loads(data.decode('utf-8'))
                             await self.handle_message(message, client_ip)
                         except json.JSONDecodeError:
-                            # If not JSON, try to handle as binary data
-                            await self.handle_binary_message(data, client_ip)
+                            logger.error(f"Received invalid JSON message from {client_ip}: {data[:100]}...")  # Log first 100 bytes
+                            if self.security_monitor:
+                                await self.security_monitor.record_failed_attempt(client_ip, 'invalid_message')
+                            continue  # Skip invalid messages instead of breaking
                         
                         # Send acknowledgment
                         ack = "ACK".encode('utf-8')
@@ -749,16 +800,16 @@ class BlockchainNetwork:
                         await writer.drain()
                         
                     except Exception as e:
-                        logger.error(f"Error handling connection from {client_ip}: {e}")
+                        logger.error(f"Error handling connection from {client_ip}: {e}", exc_info=True)
                         if self.security_monitor:
                             await self.security_monitor.record_failed_attempt(client_ip, 'connection_error')
                         break
                         
             except Exception as e:
-                logger.error(f"Connection error from {client_ip}: {e}")
+                logger.error(f"Connection error from {client_ip}: {e}", exc_info=True)
                 if self.security_monitor:
                     await self.security_monitor.record_failed_attempt(client_ip, 'connection_error')
-                
+            
             finally:
                 try:
                     writer.close()

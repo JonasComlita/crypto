@@ -518,7 +518,6 @@ class UTXOSet:
                                 script=""  # Empty script for simplicity
                             )
                             self.utxos[tx.tx_id].append(coinbase_output)
-                            logger.info(f"Added coinbase UTXO for {tx.recipient} with amount {tx.amount}")
                     else:
                         # Add transaction outputs to UTXO set
                         for i, output in enumerate(tx.outputs):
@@ -632,8 +631,8 @@ class AsyncMiner:
         self.blockchain = blockchain
         self.wallet_address = None
         
-        # Mining control
-        self.mining = False
+        # Mining control flags
+        self._is_mining = False  # Use _is_mining instead of mining
         self._stop_event = asyncio.Event()
         self._mining_task = None
 
@@ -657,38 +656,63 @@ class AsyncMiner:
             max_workers=max(1, multiprocessing.cpu_count() - 1)
         )
 
+    @property
+    def mining(self):
+        """Property to get mining state"""
+        return self._is_mining
+
+    @mining.setter
+    def mining(self, value):
+        """Property to set mining state"""
+        self._is_mining = value
+
     async def start_mining(self, wallet_address: str) -> bool:
         """Start the mining process"""
+        self._logger.info(f"Starting mining for wallet {wallet_address}")
+        
         async with self.mining_lock:
             if not wallet_address:
                 self._logger.error("No wallet address set for mining")
                 return False
 
-            if self.mining:
+            if self._is_mining:
                 self._logger.warning("Mining is already running")
                 return False
-
-            self._logger.info(f"Starting mining for wallet {wallet_address}")
-            self.wallet_address = wallet_address
-            self.mining = True
-            self.start_time = time.time()
-            self._stop_event.clear()
             
-            # Start mining in a separate task
-            self._mining_task = asyncio.create_task(self._mining_loop())
-            return True
+            # Get the latest block from the blockchain
+            latest_block = self.blockchain.get_latest_block()
+            if not latest_block:
+                self._logger.error("Cannot start mining: blockchain has no blocks")
+                return False
+
+            # Set mining parameters
+            self.wallet_address = wallet_address
+            self._is_mining = True
+            self._stop_event.clear()
+            self.start_time = time.time()
+
+            try:
+                # Start mining loop in a task
+                self._mining_task = asyncio.create_task(self._mining_loop())
+                
+                self._logger.info(f"Mining started successfully for {wallet_address}")
+                return True
+            except Exception as e:
+                self._is_mining = False
+                self._logger.error(f"Mining start error: {str(e)}", exc_info=True)
+                return False
 
     async def stop_mining(self) -> bool:
         """Stop the mining process cleanly"""
         async with self.mining_lock:
-            if not self.mining:
+            if not self._is_mining:
                 self._logger.info("Mining is not running")
                 return True
                 
             self._logger.info("Stopping mining...")
             try:
                 # Signal mining loop to stop
-                self.mining = False
+                self._is_mining = False
                 self._stop_event.set()
                 
                 # Wait for mining loop to finish (with timeout)
@@ -718,13 +742,13 @@ class AsyncMiner:
                 self._logger.error(f"Failed to stop mining: {e}")
                 return False
             finally:
-                self.mining = False
+                self._is_mining = False
 
     async def _mining_loop(self):
         """Main mining loop"""
         self._logger.info("Entering mining loop")
         try:
-            while self.mining and not self._stop_event.is_set():
+            while self._is_mining and not self._stop_event.is_set():
                 try:
                     # Create a new block to mine
                     self._logger.debug("Creating new block...")
@@ -752,10 +776,6 @@ class AsyncMiner:
                         self._logger.debug(f"Mining process completed with result: {mining_result is not None}")
                     except Exception as e:
                         self._logger.error(f"Error during mining process: {str(e)}")
-                        self._logger.error(f"Mineable data keys: {list(mineable_data.keys())}")
-                        self._logger.error(f"Block data type: {type(mineable_data)}")
-                        for key, value in mineable_data.items():
-                            self._logger.error(f"Key: {key}, Type: {type(value)}")
                         raise
                     
                     if not mining_result:
@@ -778,7 +798,6 @@ class AsyncMiner:
                     raise
                 except Exception as e:
                     self._logger.error(f"Mining error in loop: {str(e)}", exc_info=True)
-                    self._logger.error(f"Error type: {type(e)}")
                     await asyncio.sleep(0.5)
                     continue
                 
@@ -789,7 +808,7 @@ class AsyncMiner:
         except Exception as e:
             self._logger.error(f"Fatal mining loop error: {str(e)}", exc_info=True)
         finally:
-            self.mining = False
+            self._is_mining = False
             self._logger.info("Mining loop exited")
 
     async def _create_block(self) -> Optional[Block]:
@@ -926,12 +945,13 @@ class NonceTracker:
 
 class NetworkService:
     def __init__(self, blockchain_network=None):
+        from network import BlockchainNetwork
         self.network = blockchain_network
         self.peers = set()
         self.blockchain = None  # Will be set by Blockchain class
         self.message_handlers = {
             'block': self._handle_block,
-            'transaction': self._handle_transaction,
+            'transaction': self.handle_transaction,  # Use the existing method instead
             'chain_request': self._handle_chain_request
         }
 
@@ -947,14 +967,23 @@ class NetworkService:
             await self.network.stop()
         logger.info("Network service stopped")
 
+    async def handle_transaction(self, tx_data):
+        """Delegate transaction handling to the network object"""
+        if self.network and hasattr(self.network, 'receive_transaction'):
+            await self.network.receive_transaction(tx_data)
+        else:
+            logger.error("Network object not available or missing receive_transaction method")
+
     async def broadcast_block(self, block):
-        """Broadcast a new block to all peers"""
+        """Broadcast a new block to all peers with improved logging"""
         if self.network:
             try:
+                logger.info(f"Broadcasting block {block.index} with hash {block.hash[:8]} to network")
+                # Broadcast block to all connected peers
                 await self.network.broadcast_block(block)
-                logger.info(f"Block {block.index} broadcasted to network")
+                logger.info(f"Block {block.index} broadcast completed")
             except Exception as e:
-                logger.error(f"Failed to broadcast block: {e}")
+                logger.error(f"Failed to broadcast block: {e}", exc_info=True)
 
     async def broadcast_transaction(self, transaction):
         """Broadcast a new transaction to all peers"""
@@ -975,28 +1004,37 @@ class NetworkService:
                 logger.error(f"Failed to request chain: {e}")
 
     async def _handle_block(self, block_data):
-        """Handle received block from network"""
+        """Handle received block from network with improved synchronization"""
         try:
             if not self.blockchain:
                 logger.error("Blockchain reference not set in NetworkService")
                 return
-                
+                    
+            # Convert block data to Block object
             block = Block.from_dict(block_data)
-            await self.blockchain.add_block(block)
-        except Exception as e:
-            logger.error(f"Failed to handle received block: {e}")
-
-    async def _handle_transaction(self, tx_data):
-        """Handle received transaction from network"""
-        try:
-            if not self.blockchain:
-                logger.error("Blockchain reference not set in NetworkService")
+            logger.info(f"Received block {block.index} from network with hash {block.hash[:8]}")
+            
+            # Check if we already have this block
+            if any(b.hash == block.hash for b in self.blockchain.chain):
+                logger.debug(f"Block {block.index} already in our chain, ignoring")
                 return
                 
-            transaction = Transaction.from_dict(tx_data)
-            await self.blockchain.add_transaction_to_mempool(transaction)
+            # Try to add the block to our chain
+            success = await self.blockchain.add_block(block)
+            if success:
+                logger.info(f"Successfully added block {block.index} from network")
+                # Explicitly rebuild UTXO set after adding the block to ensure balances are updated
+                # No need to do this as add_block already updates UTXO set
+                
+                # Broadcast the block to our peers to ensure wide propagation
+                await self.broadcast_block(block)
+            else:
+                # If adding fails, it might be because we're missing blocks in between
+                # Request a chain update from the network
+                logger.warning(f"Failed to add block {block.index} from network, requesting chain sync")
+                await self.request_chain()
         except Exception as e:
-            logger.error(f"Failed to handle received transaction: {e}")
+            logger.error(f"Failed to handle received block: {e}", exc_info=True)
 
     async def _handle_chain_request(self, request_data):
         """Handle chain request from peers"""
@@ -1138,15 +1176,27 @@ class Blockchain:
         """Initialize blockchain"""
         from network import BlockchainNetwork
         from utils import find_available_port_async
+
+        # Ensure logger is set up
+        self._logger = logging.getLogger(f"Blockchain-{node_id or 'default'}")
+        self._logger.setLevel(logging.INFO)
+        
+        # Add a handler if no handlers exist to prevent "No handlers" warnings
+        if not self._logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self._logger.addHandler(handler)
+
     
         # Initialization flag
         self.initialized = False
         self._initializing = False
         
         # Chain storage
+        self.storage_path = os.path.abspath(storage_path if storage_path else f"chain_{node_id or 'default'}.db")
         self.chain: List[Block] = []
-        self.storage_path = storage_path if storage_path else f"chain_{node_id or 'default'}.db"
-        
+
         # Mining parameters
         self.difficulty = CONFIG["difficulty"]
         self.current_reward = CONFIG["current_reward"]
@@ -1167,7 +1217,9 @@ class Blockchain:
         # Store port as provided (or None initially)
         self.port = port
         logger.info(f"Blockchain initialized with port: {self.port}")
-        
+
+        self._logger = logging.getLogger(f"Blockchain-{node_id}")
+        self._logger.setLevel(logging.INFO)
         # Networking
         self.node_id = node_id or "default"
         self.network_service = NetworkService()
@@ -1192,9 +1244,6 @@ class Blockchain:
         
         # Mining
         self.miner = AsyncMiner(self)
-        
-        # Create genesis block to initialize the chain
-        self.create_genesis_block()
 
         self._chain_lock = asyncio.Lock()
         self._mempool_lock = asyncio.Lock()
@@ -1242,6 +1291,8 @@ class Blockchain:
             
             # Initialize network
             await self.network_service.start()
+            logger.info("Performing initial synchronization with network...")
+            await self.sync_with_network()
             
             # Update metrics
             await self.update_metrics()
@@ -1276,31 +1327,41 @@ class Blockchain:
             raise
 
     async def load_chain(self):
-        """Load blockchain from storage"""
         try:
+            logger.info(f"Attempting to load chain from {self.storage_path}")
             async with aiosqlite.connect(self.storage_path) as db:
                 async with db.execute('SELECT data FROM blocks ORDER BY id') as cursor:
                     rows = await cursor.fetchall()
+                    logger.info(f"Found {len(rows)} blocks in storage")
+                    self.chain = []
                     if rows:
-                        self.chain = [Block.from_dict(json.loads(row[0])) for row in rows]
+                        for i, row in enumerate(rows):
+                            try:
+                                block_data = json.loads(row[0])
+                                block = Block.from_dict(block_data)
+                                self.chain.append(block)
+                            except Exception as e:
+                                logger.error(f"Failed to deserialize block {i}: {e}", exc_info=True)
+                                raise
                         logger.info(f"Loaded {len(self.chain)} blocks from storage")
                     else:
                         logger.info("No existing chain found in storage")
-                        # If no chain exists, create genesis block
-                        if not self.chain:
-                            self.create_genesis_block()  # Don't await this if it's synchronous
-                            await self.save_chain()
-                            
-                        # Initialize UTXO set from chain
-                        await self._rebuild_utxo_set()
+                        self.create_genesis_block()
+                        await self.save_chain()
+                    # Always rebuild UTXO set after loading or creating chain
+                    await self._rebuild_utxo_set()
         except Exception as e:
-            logger.error(f"Failed to load chain: {e}")
+            logger.error(f"Failed to load chain from {self.storage_path}: {e}", exc_info=True)
             if "no such table" in str(e):
                 logger.info("Creating new blockchain")
+                self.chain = []
                 self.create_genesis_block()
                 await self.save_chain()
+                await self._rebuild_utxo_set()
             else:
                 raise
+        finally:
+            logger.info(f"Chain length after load: {len(self.chain)}")
 
     async def _rebuild_utxo_set(self):
         """Rebuild the UTXO set from scratch based on the blockchain"""
@@ -1311,6 +1372,10 @@ class Blockchain:
 
     def create_genesis_block(self):
         """Create the genesis block"""
+        if self.chain:
+            logger.info("Chain already exists, skipping genesis block creation")
+            return self.chain[0]
+        
         genesis_tx = Transaction(
             sender="0", 
             recipient="genesis", 
@@ -1328,30 +1393,27 @@ class Blockchain:
         return genesis_block
 
     async def save_chain(self):
-        """Save blockchain to storage"""
         try:
             async with aiosqlite.connect(self.storage_path) as db:
-                # Create table if it doesn't exist
                 await db.execute('''
                     CREATE TABLE IF NOT EXISTS blocks (
                         id INTEGER PRIMARY KEY,
                         data TEXT NOT NULL
                     )
                 ''')
-                
-                # Clear existing blocks
                 await db.execute('DELETE FROM blocks')
-                
-                # Save all blocks
                 for block in self.chain:
-                    await db.execute(
-                        'INSERT INTO blocks (data) VALUES (?)',
-                        (json.dumps(block.to_dict()),)
-                    )
+                    await db.execute('INSERT INTO blocks (data) VALUES (?)', (json.dumps(block.to_dict()),))
                 await db.commit()
-                logger.info(f"Saved {len(self.chain)} blocks to storage")
+                # Verify the save
+                async with db.execute('SELECT COUNT(*) FROM blocks') as cursor:
+                    count = (await cursor.fetchone())[0]
+                    if count != len(self.chain):
+                        logger.error(f"Save verification failed: {count} blocks in DB, {len(self.chain)} in memory")
+                        raise RuntimeError("Chain save incomplete")
+                logger.info(f"Saved {len(self.chain)} blocks to {self.storage_path}")
         except Exception as e:
-            logger.error(f"Failed to save chain: {e}")
+            logger.error(f"Failed to save chain to {self.storage_path}: {e}", exc_info=True)
             raise
 
     # Update the wallet handling methods in Blockchain class
@@ -1743,31 +1805,54 @@ class Blockchain:
                 await self.network_service.request_chain()
 
     async def replace_chain(self, new_chain: List[Block]) -> bool:
-        """Replace the current chain with a longer, valid chain"""
+        """Replace the current chain with a longer, valid chain with proper UTXO handling"""
         async with self._lock:
-            # New chain must be longer than current chain
-            if len(new_chain) <= len(self.chain):
+            try:
+                # New chain must be longer than current chain
+                if len(new_chain) <= len(self.chain):
+                    logger.info(f"New chain length {len(new_chain)} not longer than current chain length {len(self.chain)}")
+                    return False
+                    
+                # New chain must be valid
+                if await self.is_valid_chain(new_chain):
+                    logger.info(f"Replacing chain of length {len(self.chain)} with new chain of length {len(new_chain)}")
+                    
+                    # Store old chain for reversion if needed
+                    old_chain = self.chain.copy()
+                    
+                    try:
+                        # Replace chain
+                        self.chain = new_chain
+                        
+                        # Rebuild UTXO set completely from scratch to ensure consistency
+                        logger.info("Rebuilding UTXO set with new chain")
+                        await self._rebuild_utxo_set()
+                        
+                        # Save to storage
+                        await self.save_chain()
+                        
+                        # Update metrics
+                        await self.update_metrics()
+                        
+                        # Notify listeners about new blocks
+                        # This ensures the GUI updates to show the new chain state
+                        for i in range(len(old_chain), len(new_chain)):
+                            self.trigger_event("new_block", new_chain[i])
+                        
+                        logger.info(f"Chain replacement complete. Now at block {len(self.chain)-1}")
+                        return True
+                    except Exception as e:
+                        # If something goes wrong, revert to old chain
+                        logger.error(f"Error during chain replacement: {e}")
+                        self.chain = old_chain
+                        await self._rebuild_utxo_set()  # Rebuild UTXO set with old chain
+                        return False
+                else:
+                    logger.warning("Received chain is invalid, rejecting")
+                    return False
+            except Exception as e:
+                logger.error(f"Chain replacement error: {e}", exc_info=True)
                 return False
-                
-            # New chain must be valid
-            if await self.is_valid_chain(new_chain):
-                logger.info(f"Replacing chain of length {len(self.chain)} with new chain of length {len(new_chain)}")
-                
-                # Replace chain
-                self.chain = new_chain
-                
-                # Rebuild UTXO set
-                await self._rebuild_utxo_set()
-                
-                # Save to storage
-                await self.save_chain()
-                
-                # Update metrics
-                await self.update_metrics()
-                
-                return True
-                
-            return False
 
     def subscribe(self, event: str, callback: Callable) -> None:
         """Subscribe to blockchain events"""
@@ -2084,36 +2169,45 @@ class Blockchain:
 
     def get_latest_block(self) -> Optional[Block]:
         """Get the latest block in the chain"""
+        
         return self.chain[-1] if self.chain else None
 
-    async def start_mining(self, wallet_address: Optional[str] = None) -> bool:
-        """Start mining blocks"""
-        logger.info("Attempting to start mining...")
+    async def start_mining(self, wallet_address: str) -> bool:
+        """Start the mining process after synchronizing with the network."""
+        self._logger.info(f"Starting mining for wallet {wallet_address}")
+        
+        if not wallet_address:
+            self._logger.error("No wallet address set for mining")
+            return False
+
+        # Force synchronization before starting mining
+        self._logger.info("Synchronizing with network before starting mining...")
         try:
-            # If no wallet address provided, use first available
-            if self.wallets:
-                wallet_address = next(iter(self.wallets.keys()))
-                logger.info(f"Using existing wallet from storage: {wallet_address}")
-            else:
-                addresses = await self.get_all_addresses()
-                if not addresses:
-                    # Create a new wallet if none exist
-                    wallet_address = await self.create_wallet()
-                    logger.info(f"Created new mining wallet: {wallet_address}")
-                else:
-                    wallet_address = addresses[0]
-                    
-            # Start mining with chosen wallet
+            # Call network synchronization through network service
+            if self.network_service:
+                await self.network_service.request_chain()
+        except Exception as sync_error:
+            self._logger.error(f"Network sync failed before mining: {sync_error}")
+        
+        # Use self.get_latest_block() 
+        if not self.get_latest_block():
+            self._logger.error("Cannot start mining: blockchain has no blocks")
+            return False
+
+        self._logger.info(f"Starting mining for wallet {wallet_address}")
+        
+        try:
+            # Start mining using the miner's method
             result = await self.miner.start_mining(wallet_address)
             
             if result:
-                logger.info(f"Mining started successfully with address: {wallet_address}")
+                self._logger.info(f"Mining started successfully for {wallet_address}")
+                return True
             else:
-                logger.warning("Mining failed to start")
-                
-            return result
+                self._logger.error("Failed to start mining")
+                return False
         except Exception as e:
-            logger.error(f"Mining error: {e}")
+            self._logger.error(f"Mining start error: {str(e)}", exc_info=True)
             return False
 
     async def stop_mining(self) -> bool:
@@ -2147,6 +2241,14 @@ class Blockchain:
         except Exception as e:
             logger.error(f"Failed to create coinbase transaction: {e}")
             raise
+
+    async def sync_with_network(self):
+        """Force an immediate synchronization with the network"""
+        if self.network_service:
+            logger.info("Initiating blockchain synchronization with network")
+            await self.network_service.request_chain()
+            return True
+        return False
 
 class ResourceMonitor:
     def __init__(self, blockchain):
@@ -2257,7 +2359,7 @@ class BlockchainNode:
             
         try:
             # Stop mining if active
-            if self.blockchain.miner.mining:
+            if self.mining:
                 await self.blockchain.stop_mining()
             
             # Stop resource monitor

@@ -15,7 +15,8 @@ import queue
 import threading
 import gc
 import concurrent.futures
-
+import sys
+import random
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,11 @@ class BlockchainGUI:
         self.mining = False
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self.main_loop, daemon=True)
-        self.shutdown_event = threading.Event()
+        self.after_ids = []
+        self._shutdown_in_progress = False
+        asyncio.run_coroutine_threadsafe(
+            self.start_network_sync(), self.loop
+        )
         
         self.root = tk.Tk()
         self.root.title("OriginalCoin Blockchain")
@@ -312,6 +317,14 @@ class BlockchainGUI:
         # Node information
         info_frame = ttk.LabelFrame(network_frame, text="Node Information", padding="10")
         info_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # Add sync button
+        sync_btn = ttk.Button(
+            info_frame,
+            text="Sync Now",
+            command=self.sync_chain
+        )
+        sync_btn.grid(row=0, column=0, padx=5, pady=5)
         
         self.node_id_var = tk.StringVar(value=f"Node ID: {self.network.node_id}")
         self.peers_var = tk.StringVar(value="Connected Peers: 0")
@@ -411,13 +424,56 @@ class BlockchainGUI:
             logger.error(f"Error in update_network_tab: {str(e)}")
             self.show_error(f"Network tab update failed: {str(e)}")
 
+    async def start_network_sync(self):
+        """Start network synchronization"""
+        try:
+            # Request immediate chain sync on startup
+            await self.blockchain.sync_with_network()
+            
+            # Ensure network's periodic sync is running
+            if hasattr(self.network, 'start_periodic_sync'):
+                await self.network.start_periodic_sync(interval=30)
+                logger.info("Started periodic network synchronization")
+        except Exception as e:
+            logger.error(f"Failed to start network sync: {e}", exc_info=True)
+
+    def sync_chain(self):
+        """Synchronize the blockchain with the network"""
+        try:
+            self.status_var.set("Syncing with network...")
+            
+            async def do_sync():
+                try:
+                    # Request chain updates from network
+                    result = await self.blockchain.sync_with_network()
+                    
+                    # Update UI after sync
+                    wallet = self.selected_wallet.get()
+                    if wallet != "Select Wallet" and wallet:
+                        await self.update_async_balance(wallet)
+                        await self.update_async_transaction_history(wallet)
+                        
+                    self.update_queue.put(lambda: self.status_var.set(
+                        "Sync completed" if result else "Sync failed or no updates found"))
+                except Exception as e:
+                    logger.error(f"Chain sync error: {e}", exc_info=True)
+                    self.update_queue.put(lambda: self.status_var.set(f"Sync error: {str(e)}"))
+            
+            # Run the sync operation in the event loop
+            asyncio.run_coroutine_threadsafe(do_sync(), self.loop)
+        except Exception as e:
+            self.show_error(f"Failed to sync chain: {str(e)}")
+
     def process_queue(self):
         """Process the update queue for thread-safe UI updates"""
         try:
             while not self.update_queue.empty():
-                func = self.update_queue.get_nowait()
-                logger.debug(f"Processing queue item: {func}")
-                func()
+                try:
+                    func = self.update_queue.get_nowait()
+                    logger.debug(f"Processing queue item: {func}")
+                    func()
+                except Exception as queue_error:
+                    logger.error(f"Error processing queue item: {queue_error}", exc_info=True)
         except Exception as e:
             logger.error(f"Queue processing error: {e}")
         self.root.after(100, self.process_queue)
@@ -433,41 +489,59 @@ class BlockchainGUI:
             logger.info("Starting mining callback triggered")
             wallet_address = self.selected_wallet.get()
 
-            # If no wallet is selected, use or create a default one
-            if wallet_address == "Select Wallet" or not wallet_address:
-                async def get_or_create_address():
+            async def get_or_create_address():
+                try:
                     addresses = await self.blockchain.get_all_addresses()
                     if addresses:
                         return addresses[0]
                     else:
                         return await self.blockchain.create_wallet()
-
-                future = asyncio.run_coroutine_threadsafe(get_or_create_address(), self.loop)
-                wallet_address = future.result(timeout=5)
-                self.selected_wallet.set(wallet_address)  # Update GUI dropdown
-
-            if not wallet_address:
-                self.show_error("No wallet available for mining")
-                return
+                except Exception as addr_error:
+                    logger.error(f"Error getting or creating wallet address: {addr_error}")
+                    raise
 
             async def start_mining_coroutine():
                 try:
-                    await self.blockchain.network.request_chain()
+                    # Get or create wallet address
+                    wallet_address = await get_or_create_address()
+                    
+                    # Sanity check
+                    if not wallet_address:
+                        error_msg = "No wallet available for mining"
+                        logger.error(error_msg)
+                        self.update_queue.put(lambda: self.show_error(error_msg))
+                        return
+
+                    # Set the selected wallet if not already set
+                    if self.selected_wallet.get() == "Select Wallet":
+                        self.selected_wallet.set(wallet_address)
+
+                    # Sync the network
+                    await self.blockchain.sync_with_network()
+                    
+                    # Start mining
                     result = await self.blockchain.start_mining(wallet_address)
+                    
                     if result:
                         self.update_queue.put(self.mining_started)
-                        asyncio.run_coroutine_threadsafe(self.update_async_balance(wallet_address), self.loop)
+                        await self.update_async_balance(wallet_address)
                     else:
-                        self.update_queue.put(lambda: self.show_error("Failed to start mining"))
-                except Exception as e:
-                    logger.error(f"Mining coroutine exception: {str(e)}")
-                    self.update_queue.put(lambda: self.show_error(f"Mining start failed: {str(e)}"))
+                        error_msg = "Failed to start mining"
+                        logger.error(error_msg)
+                        self.update_queue.put(lambda: self.show_error(error_msg))
+                    
+                except Exception as mining_error:
+                    error_msg = f"Mining start failed: {str(mining_error)}"
+                    logger.error(error_msg, exc_info=True)
+                    self.update_queue.put(lambda: self.show_error(error_msg))
 
+            # Run the coroutine in the event loop
             asyncio.run_coroutine_threadsafe(start_mining_coroutine(), self.loop)
 
-        except Exception as e:
-            logger.error(f"Mining callback exception: {str(e)}")
-            self.show_error(f"Mining initialization error: {str(e)}")
+        except Exception as outer_error:
+            error_msg = f"Mining initialization error: {str(outer_error)}"
+            logger.error(error_msg, exc_info=True)
+            self.update_queue.put(lambda: self.show_error(error_msg))
             
     def show_error(self, message):
         """Thread-safe method to show error message"""
@@ -529,10 +603,13 @@ class BlockchainGUI:
                 return
             try:
                 hashrate = await self.blockchain.get_hashrate()
-                blocks_mined = self.blockchain.miner.blocks_mined
+                # Get blocks mined directly from the blockchain's miner
+                blocks_mined = self.blockchain.miner.blocks_mined if hasattr(self.blockchain.miner, 'blocks_mined') else 0
+                
                 logger.info(f"Updating mining stats - Hashrate: {hashrate:.2f} H/s, Blocks: {blocks_mined}")
                 self.hashrate_var.set(f"Hashrate: {hashrate:.2f} H/s")
                 self.blocks_mined_var.set(f"Blocks Mined: {blocks_mined}")
+                
                 # Update recent blocks
                 self.update_queue.put(lambda: self.update_blocks_tree(self.blockchain.chain[-6:]))
                 logger.info(f"Updated stats - Hashrate: {hashrate:.2f} H/s, Blocks: {blocks_mined}")
@@ -546,14 +623,14 @@ class BlockchainGUI:
                 # Schedule the next update
                 logger.info("Scheduling next mining stats update")
                 asyncio.run_coroutine_threadsafe(update_stats(), self.loop)
-                self.root.after(5000, schedule_next_update)
+                self.root.after(1000, schedule_next_update)
             else:
                 logger.info("Mining stopped, stopping stats update")
 
         # Start the update cycle
         logger.info("Starting mining stats update cycle")
         asyncio.run_coroutine_threadsafe(update_stats(), self.loop)
-        self.root.after(5000, schedule_next_update)
+        self.root.after(1000, schedule_next_update)
 
     def update_blocks_tree(self, blocks):
         """Update the blocks tree with the given blocks"""
@@ -644,6 +721,7 @@ class BlockchainGUI:
             logger.error(f"Wallet dropdown update initialization error: {str(e)}")
             self.show_error(f"Failed to initiate wallet dropdown update: {str(e)}")
 
+    
     def populate_wallet_dropdown(self, addresses):
         """Populate the wallet dropdown with the given addresses"""
         try:
@@ -651,13 +729,16 @@ class BlockchainGUI:
             menu = self.wallet_dropdown["menu"]
             menu.delete(0, "end")
             
-            # Add "Select Wallet" as default
-            self.selected_wallet.set("Select Wallet")
-            menu.add_command(
-                label="Select Wallet", 
-                command=lambda: self.selected_wallet.set("Select Wallet")
-            )
-            
+            if not addresses:
+                # If no addresses, set to "Select Wallet"
+                self.selected_wallet.set("Select Wallet")
+                menu.add_command(
+                    label="Select Wallet", 
+                    command=lambda: self.selected_wallet.set("Select Wallet")
+                )
+                logger.info("No wallet addresses found")
+                return
+                    
             # Add wallet addresses
             for address in addresses:
                 menu.add_command(
@@ -665,10 +746,20 @@ class BlockchainGUI:
                     command=lambda a=address: self.on_wallet_selected(a)
                 )
             
-            # Optional: Log the number of wallets found
+            # Log the number of wallets found
             logger.info(f"Populated wallet dropdown with {len(addresses)} addresses")
+            
+            # Select the first wallet by default if none is selected
+            current = self.selected_wallet.get()
+            if current == "Select Wallet" or current not in addresses:
+                logger.info(f"Automatically selecting first wallet: {addresses[0]}")
+                # Directly set the wallet and update balance
+                self.selected_wallet.set(addresses[0])
+                asyncio.run_coroutine_threadsafe(self.update_async_balance(addresses[0]), self.loop)
+                asyncio.run_coroutine_threadsafe(self.update_async_transaction_history(addresses[0]), self.loop)
+            
         except Exception as e:
-            logger.error(f"Error populating wallet dropdown: {str(e)}")
+            logger.error(f"Error populating wallet dropdown: {str(e)}", exc_info=True)
             self.show_error(f"Failed to populate wallet dropdown: {str(e)}")
 
     def on_wallet_selected(self, address):
@@ -684,42 +775,17 @@ class BlockchainGUI:
                             lambda: messagebox.showerror("Error", "MFA verification failed")
                         )
                         return
+                
+                logger.debug(f"Setting selected wallet to: {address}")
                 self.selected_wallet.set(address)
+                
+                # Update the balance immediately
                 await self.update_async_balance(address)
                 await self.update_async_transaction_history(address)
+                logger.debug(f"Balance updated for wallet: {address}")
             
+            # Create and run the coroutine to verify and select the wallet
             asyncio.run_coroutine_threadsafe(verify_and_select(), self.loop)
-                    
-            logger.debug(f"Setting selected wallet to: {address}")
-            self.selected_wallet.set(address)
-            
-            # Update balance and transaction history asynchronously
-            async def update_wallet_info():
-                try:
-                    logger.debug("Starting wallet info update")
-                    await self.update_async_balance(address)
-                    await self.update_async_transaction_history(address)
-                    logger.debug("Wallet info update completed")
-                except Exception as e:
-                    logger.error(f"Error updating wallet info: {str(e)}", exc_info=True)
-                    self.update_queue.put(
-                        lambda: messagebox.showerror("Error", f"Failed to update wallet information: {str(e)}")
-                    )
-            
-            logger.debug("Scheduling wallet info update")
-            update_future = asyncio.run_coroutine_threadsafe(update_wallet_info(), self.loop)
-            
-            # Add a callback to handle any errors in the update
-            def handle_update_done(future):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Wallet info update failed: {str(e)}", exc_info=True)
-                    self.update_queue.put(
-                        lambda: messagebox.showerror("Error", f"Failed to update wallet information: {str(e)}")
-                    )
-            
-            update_future.add_done_callback(handle_update_done)
                 
         except Exception as e:
             logger.error(f"Error in wallet selection: {str(e)}", exc_info=True)
@@ -837,8 +903,9 @@ class BlockchainGUI:
     async def update_async_balance(self, address):
         """Update the balance display asynchronously"""
         try:
+            logger.debug(f"Fetching balance for address: {address}")
             balance = await self.blockchain.get_balance(address)
-            self.update_queue.put(lambda: self.balance_label.config(text=f"Balance: {balance:.2f} ORIG"))
+            logger.info(f"Balance for {address}: {balance:.2f} ORIG")
             
             # Add security indicator if wallet is backed up
             backup_status = ""
@@ -850,28 +917,50 @@ class BlockchainGUI:
             balance_text = f"Balance: {balance:.2f} ORIG {backup_status}"
             self.update_queue.put(lambda: self.balance_label.config(text=balance_text))
             
-            
         except Exception as e:
-            logger.error(f"Balance update error: {str(e)}")
+            logger.error(f"Balance update error for {address}: {str(e)}", exc_info=True)
             self.update_queue.put(lambda: self.show_error(f"Failed to update balance: {str(e)}"))
 
 
     def schedule_balance_updates(self):
-        """Periodically update the balance like hashrate and blocks mined"""
-        async def update_balance():
-            wallet = self.selected_wallet.get()
-            if wallet and wallet != "Select Wallet":
-                try:
-                    balance = await self.blockchain.get_balance(wallet)
-                    self.update_queue.put(lambda: self.balance_label.config(text=f"Balance: {balance:.2f} ORIG"))
-                    logger.debug(f"Updated balance for {wallet}: {balance:.2f} ORIG")
-                except Exception as e:
-                    logger.error(f"Balance update error: {str(e)}")
-                    self.update_queue.put(lambda: self.show_error(f"Failed to update balance: {str(e)}"))
+        """Periodically update the balance and check blockchain status"""
+        async def update_chain_info():
+            try:
+                # Get current chain status
+                latest_block = self.blockchain.get_latest_block()
+                if latest_block:
+                    # Update status bar with current block height
+                    self.update_queue.put(lambda: self.status_var.set(f"Block: {latest_block.index}"))
 
-        # Schedule the update
-        asyncio.run_coroutine_threadsafe(update_balance(), self.loop)
-        self.root.after(5000, self.schedule_balance_updates)
+                # Update balance if wallet is selected
+                wallet = self.selected_wallet.get()
+                if wallet and wallet != "Select Wallet":
+                    try:
+                        # Force a new balance fetch from UTXO set
+                        balance = await self.blockchain.get_balance(wallet)
+                        self.update_queue.put(lambda: self.balance_label.config(text=f"Balance: {balance:.2f} ORIG"))
+                        logger.debug(f"Updated balance for {wallet}: {balance:.2f} ORIG")
+                        
+                        # Periodically request chain sync (10% chance each update)
+                        if random.random() < 0.1:
+                            logger.debug("Triggering chain synchronization")
+                            await self.blockchain.sync_with_network()
+                    except Exception as e:
+                        logger.error(f"Balance update error: {str(e)}")
+            except Exception as e:
+                logger.error(f"Chain update error: {str(e)}")
+        
+        def schedule_next():
+            if not self._shutdown_in_progress:  # Only schedule if not shutting down
+                future = asyncio.run_coroutine_threadsafe(update_chain_info(), self.loop)
+                after_id = self.root.after(5000, schedule_next)  # Every 5 seconds
+                self.after_ids.append(after_id)
+
+        # Start the update cycle
+        if not self._shutdown_in_progress:
+            future = asyncio.run_coroutine_threadsafe(update_chain_info(), self.loop)
+            after_id = self.root.after(5000, schedule_next)
+            self.after_ids.append(after_id)
 
     async def update_async_transaction_history(self, address):
         """Update the transaction history asynchronously"""
@@ -1201,59 +1290,95 @@ class BlockchainGUI:
         asyncio.run_coroutine_threadsafe(self.restore_keys(), self.loop)
 
     def on_closing(self):
-        """Handle application shutdown on window close"""
+        """Handle window closing event with proper cleanup"""
         logger.info("Window close requested, initiating shutdown")
-        try:
-            if hasattr(self, '_shutdown_in_progress') and self._shutdown_in_progress:
-                logger.debug("Shutdown already in progress")
-                return
-            self._shutdown_in_progress = True
-            self.status_var.set("Shutting down...")
-            
-            async def cleanup():
+        if self._shutdown_in_progress:
+            logger.info("Shutdown already in progress, skipping duplicate call")
+            return
+        self._shutdown_in_progress = True
+        self.status_var.set("Shutting down...")
+
+        def shutdown_thread():
+            try:
+                # Run async cleanup - don't wait for result as that's causing issues
+                cleanup_future = asyncio.run_coroutine_threadsafe(self._async_cleanup(), self.loop)
+                
+                # Wait a moment to let cleanup start but don't block
+                time.sleep(2)
+                
+                # Signal the event loop to stop
+                if self.loop.is_running():
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                
+                # Join the thread with timeout to avoid hanging
+                self.loop_thread.join(timeout=3)
+                if self.loop_thread.is_alive():
+                    logger.warning("Async loop thread did not terminate in time")
+                
+                # Cancel all root.after() callbacks
+                for after_id in self.after_ids:
+                    try:
+                        self.root.after_cancel(after_id)
+                    except Exception:
+                        pass  # Ignore errors during cleanup
+                self.after_ids.clear()
+                
+                # Force GUI exit
                 try:
-                    if self.mining:
-                        await self.blockchain.stop_mining()
-                        logger.debug("Mining stopped")
-                    if self.network:
-                        await self.network.stop()  # Single call to stop network
-                        logger.debug("Network stopped")
-                    if hasattr(self.blockchain, 'shutdown'):
-                        await self.blockchain.shutdown()
-                        logger.debug("Blockchain stopped")
+                    self.root.quit()
+                    self.root.update()  # Process any remaining Tkinter events
+                    self.root.destroy()
                 except Exception as e:
-                    logger.error(f"Cleanup error: {e}")
-                finally:
-                    self.shutdown_event.set()
-            
-            cleanup_future = asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
-            self.root.after(500, self._delayed_exit, cleanup_future)
-            
-        except Exception as e:
-            logger.error(f"Shutdown initiation error: {e}")
-            self.root.destroy()
+                    logger.error(f"Error during GUI shutdown: {e}")
+                
+                logger.info("GUI shutdown completed")
+                
+                # Exit without trying to clean up the event loop further
+                os._exit(0)  # Force exit without more event loop operations
+                
+            except Exception as e:
+                logger.error(f"Shutdown error: {e}", exc_info=True)
+                os._exit(1)  # Force exit on error
 
-    def _delayed_exit(self, cleanup_future):
-        """Handle delayed GUI exit after cleanup"""
+        # Run shutdown in a separate thread
+        threading.Thread(target=shutdown_thread, daemon=True).start()
+
+    async def _async_cleanup(self):
+        """Perform asynchronous cleanup tasks"""
         try:
-            cleanup_future.result(timeout=3)
-            logger.info("Shutdown completed")
-        except concurrent.futures.TimeoutError:
-            logger.warning("Shutdown timed out")
-        except Exception as e:
-            logger.error(f"Shutdown error: {e}")
-        finally:
-            if not self.loop.is_closed():
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            self.root.quit()
-            self.root.destroy()
+            # Stop mining
+            if self.mining:
+                await self.blockchain.stop_mining()
+                logger.info("Mining stopped during shutdown")
 
-    def exit(self):
-        """Add an explicit exit method for external shutdown calls"""
-        if not hasattr(self, '_shutdown_in_progress') or not self._shutdown_in_progress:
-            self.on_closing()
-        else:
-            logger.info("Exit called while shutdown in progress")
+            # Stop network
+            if self.network:
+                await self.network.stop()
+                logger.info("Network stopped during shutdown")
+
+            # Shutdown blockchain
+            if hasattr(self.blockchain, 'shutdown'):
+                await self.blockchain.shutdown()
+                logger.info("Blockchain shutdown completed")
+
+            # Cancel all remaining tasks
+            pending = [t for t in asyncio.all_tasks(self.loop) if not t.done()]
+            logger.info(f"Cancelling {len(pending)} pending tasks")
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    done, still_pending = await asyncio.wait(
+                        pending, timeout=5, return_when=asyncio.ALL_COMPLETED
+                    )
+                    if still_pending:
+                        logger.warning(f"{len(still_pending)} tasks did not complete during shutdown")
+                except Exception as e:
+                    logger.error(f"Task cancellation error: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Async cleanup error: {e}", exc_info=True)
+            raise
 
     def cleanup_resources(self):
         """Periodic cleanup of resources"""
@@ -1278,22 +1403,39 @@ class BlockchainGUI:
             logger.error(f"Failed to clear clipboard: {e}")
 
     def run(self):
-        """Run the blockchain GUI"""
-        # Initial data loading with wallet loading
-        async def initialize():
+        """Run the GUI with proper initialization"""
+        async def initialize_and_run():
             try:
-                # Ensure wallets are loaded before updating the dropdown
-                await self.blockchain.load_wallets()
-                logger.info("Wallets loaded during initialization")
+                # Ensure blockchain is fully initialized
+                await self.blockchain.initialize()
+                logger.info("Blockchain fully initialized before GUI start")
+                
+                # Update wallet dropdown
                 self.update_queue.put(lambda: self.update_wallet_dropdown())
+                
+                # Give time for wallet dropdown to populate
+                await asyncio.sleep(0.5)
+                
+                # Get the first wallet address and update its balance
+                addresses = await self.blockchain.get_all_addresses()
+                if addresses:
+                    first_address = addresses[0]
+                    logger.info(f"Setting initial wallet to: {first_address}")
+                    self.update_queue.put(lambda: self.selected_wallet.set(first_address))
+                    await self.update_async_balance(first_address)
+                    await self.update_async_transaction_history(first_address)
+                    logger.info(f"Updated balance for wallet: {first_address}")
             except Exception as e:
-                logger.error(f"Error during initialization: {e}")
+                logger.error(f"Error during initialization: {e}", exc_info=True)
                 self.update_queue.put(lambda: self.show_error(f"Initialization failed: {e}"))
 
-        # Run the initialization coroutine
-        asyncio.run_coroutine_threadsafe(initialize(), self.loop)
-
-        # Start UI main loop
+        # Run initialization in the event loop
+        asyncio.run_coroutine_threadsafe(initialize_and_run(), self.loop)
+        
+        # Wait a moment to let initialization tasks start
+        time.sleep(1)
+        
+        # Start the mainloop
         self.root.mainloop()
 
 

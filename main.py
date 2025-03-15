@@ -45,7 +45,7 @@ async def health_check(host: str, port: int, client_ssl_context, retries: int = 
             for attempt in range(retries):
                 try:
                     # Try without SSL first
-                    async with session.get(f"http://{host}:{health_port}/health") as resp:
+                    async with session.get(f"https://{host}:{health_port}/health") as resp:
                         if resp.status == 200:
                             return True
                 except Exception as e:
@@ -241,19 +241,6 @@ def run_async_loop(loop):
         logger.error(f"Async loop crashed: {e}")
     finally:
         logger.info("Async loop stopped")
-        try:
-            # Ensure all tasks are properly cancelled and loop is closed
-            if not loop.is_closed():
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                
-                # Run the loop briefly to process cancellations
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                loop.close()
-        except Exception as e:
-            logger.error(f"Error closing loop: {e}")
-
 
 async def async_main(args, loop, wallet_password: str):
     try:
@@ -333,62 +320,29 @@ def main():
     async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
     async_thread.start()
     
-    # Initialize components
-    blockchain = None
-    network = None
-    rotation_manager = None
-    gui = None
-    shutdown_event = None
-    
+    # Initialize components asynchronously
     try:
-        # Initialize the application
-        init_future = asyncio.run_coroutine_threadsafe(async_main(args, loop, wallet_password), loop)
-        components = init_future.result(timeout=30)
-        blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event = components
-        
-        # Create and configure the GUI
-        gui = BlockchainGUI(blockchain, network, mfa_manager=mfa_manager, backup_manager=backup_manager)
-        gui.loop = loop
-        
-        # Run the GUI
-        gui.run()
-
+        blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event = asyncio.run(
+            async_main(args, loop, wallet_password)
+        )
     except Exception as e:
-        logger.error(f"Error in main: {e}", exc_info=True)  
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-    finally:
-        try:
-            # Ensure GUI cleanup only happens once
-            if 'gui' in locals() and gui:
-                if not hasattr(gui, '_shutdown_in_progress'):
-                    gui.exit()
-            
-            # Stop the event loop
-            if not loop.is_closed():
-                loop.call_soon_threadsafe(loop.stop)
-            
-            # Wait briefly for async thread
-            if 'async_thread' in locals() and async_thread.is_alive():
-                async_thread.join(timeout=2)
-            
-            # Kill all remaining threads except main thread
-            for thread in threading.enumerate():
-                if thread != threading.current_thread() and not thread.daemon:
-                    try:
-                        thread._stop()
-                    except:
-                        pass
-            
-            logger.info("Clean shutdown completed")
-            
-            # Force exit after brief delay
-            time.sleep(0.5)  # Give logger time to write
-            os._exit(0)  # Force immediate termination
-            
-        except Exception as e:
-            logger.error(f"Error during final cleanup: {e}")
-            os._exit(1)
+        logger.error(f"Initialization failed: {e}", exc_info=True)
+        sys.exit(1)
+
+    # Create and configure the GUI
+    gui = BlockchainGUI(blockchain, network, mfa_manager=mfa_manager, backup_manager=backup_manager)
+    gui.loop = loop
+    
+    # Run the GUI
+    try:
+        gui.run()
+    except Exception as e:
+        logger.error(f"Error running GUI: {e}", exc_info=True)
+    
+    # After GUI exits, use os._exit to terminate completely
+    # We don't need to clean up the event loop as the GUI's on_closing handler already did that
+    logger.info("Application exiting")
+    os._exit(0) 
 
 if __name__ == "__main__":
     try:
