@@ -1293,6 +1293,11 @@ class Blockchain:
             await self.network_service.start()
             logger.info("Performing initial synchronization with network...")
             await self.sync_with_network()
+
+            # If no chain exists after sync, create genesis block
+            if not self.chain:
+                self.create_genesis_block()
+                await self.save_chain()
             
             # Update metrics
             await self.update_metrics()
@@ -2242,13 +2247,26 @@ class Blockchain:
             logger.error(f"Failed to create coinbase transaction: {e}")
             raise
 
+    
     async def sync_with_network(self):
-        """Force an immediate synchronization with the network"""
+        """Force a comprehensive synchronization with the network"""
         if self.network_service:
-            logger.info("Initiating blockchain synchronization with network")
-            await self.network_service.request_chain()
-            return True
-        return False
+            logger.info("Initiating comprehensive blockchain synchronization")
+            try:
+                # Attempt to sync the chain
+                sync_result = await self.network_service.request_chain()
+                
+                # If sync was successful and chain changed, rebuild UTXO set
+                if sync_result:
+                    await self._rebuild_utxo_set()
+                    logger.info("Network sync completed successfully")
+                    return True
+                
+                logger.info("No updates found during network sync")
+                return False
+            except Exception as e:
+                logger.error(f"Network synchronization error: {e}")
+                return False
 
 class ResourceMonitor:
     def __init__(self, blockchain):

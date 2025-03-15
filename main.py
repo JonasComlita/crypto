@@ -9,6 +9,7 @@ import time
 import concurrent.futures
 from blockchain import Blockchain, Transaction, TransactionType, Block
 from network import BlockchainNetwork
+from network import load_config, NodeIdentity
 import getpass
 from utils import init_rotation_manager, find_available_port_async
 from gui import BlockchainGUI
@@ -37,15 +38,17 @@ def create_ssl_context():
 
 async def health_check(host: str, port: int, client_ssl_context, retries: int = 5, delay: float = 1.0) -> bool:
     """Check if the node is healthy and responding"""
-    health_port = port + 1  # Health check runs on main port + 1
+    # In our new architecture, health check is on the API port (port + 1)
+    health_port = port + 1
     
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for attempt in range(retries):
                 try:
-                    # Try without SSL first
-                    async with session.get(f"https://{host}:{health_port}/health") as resp:
+                    # Use the /health endpoint on the HTTP API server
+                    async with session.get(f"https://{host}:{health_port}/health", 
+                                           ssl=client_ssl_context) as resp:
                         if resp.status == 200:
                             return True
                 except Exception as e:
@@ -65,7 +68,7 @@ async def run_async_tasks(blockchain: Blockchain, network: BlockchainNetwork, ro
         # Give servers time to start
         await asyncio.sleep(3)
         
-        # Check health
+        # Check health using the network's port (HTTP API will be on port+1)
         if not await health_check(network.host, network.port, network.client_ssl_context):
             logger.error("Health check failed after retries, exiting...")
             await network.stop()
@@ -244,19 +247,27 @@ def run_async_loop(loop):
 
 async def async_main(args, loop, wallet_password: str):
     try:
-        port = await find_available_port_async()
-        api_port = port + 1000
-        node_id = f"node{port}"
-        logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
+        config = load_config(args.config)
+
+        # Override config with command line arguments if provided
+        if args.p2p_port:
+            config["p2p_port"] = args.p2p_port
+        if args.api_port:
+            config["api_port"] = args.api_port
+        if args.data_dir:
+            config["data_dir"] = args.data_dir
+
+        # Initialize blockchain with node identity
+        node_identity = NodeIdentity(config["data_dir"])
+        node_id, private_key, public_key = await node_identity.initialize()
         
         # Initialize blockchain with default password first
-        blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=port)  # No password yet
-        
+        blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=config["p2p_port"])  # No password yet
+
+        bootstrap_nodes = []
          # Check for bootstrap nodes from args before defaulting to empty list
         if args.bootstrap:
             try:
-                # Split comma-separated string into list of host:port pairs
-                bootstrap_nodes = []
                 for node in args.bootstrap.split(","):
                     node = node.strip()
                     host, port_str = node.split(":")
@@ -269,22 +280,30 @@ async def async_main(args, loop, wallet_password: str):
                 logger.error(f"Failed to parse bootstrap nodes '{args.bootstrap}': {e}")
                 logger.info("Falling back to no bootstrap nodes")
                 bootstrap_nodes = []
-        else:
-            bootstrap_nodes = []
-            logger.info("No bootstrap nodes provided, starting with empty peer list")
 
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
         from utils import rotation_manager
         if not rotation_manager:
             await init_rotation_manager(node_id)  # Initializes global rotation_manager
-        # Use the global instance directly instead of creating a new one
-        network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, bootstrap_nodes, security_monitor=security_monitor)
+        
+        # Create network with the correct config
+        network = BlockchainNetwork(
+            blockchain, 
+            node_id, 
+            "127.0.0.1", 
+            config["p2p_port"],
+            bootstrap_nodes, 
+            security_monitor=security_monitor,
+            config_path=args.config
+        )
         network.loop = loop
+        
+        # Start the network
         network_start_task = asyncio.create_task(network.start())
         
         from key_rotation.main import main as rotation_main
         shutdown_event = asyncio.Event()
-        asyncio.create_task(rotation_main(node_id, args.validator, api_port, "127.0.0.1", loop, shutdown_event))
+        asyncio.create_task(rotation_main(node_id, args.validator, config["key_rotation_port"], "127.0.0.1", loop, shutdown_event))
         
         return blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event
     except Exception as e:
@@ -294,10 +313,13 @@ async def async_main(args, loop, wallet_password: str):
 def main():
     set_resource_limits()
     parser = argparse.ArgumentParser(description="Run a blockchain node.")
-    parser.add_argument("--port", type=int, default=None, help="Port to run the node on (1024-65535)")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to configuration file")
+    parser.add_argument("--p2p-port", type=int, default=None, help="P2P communication port (default: 8333)")
+    parser.add_argument("--api-port", type=int, default=None, help="HTTP API port (default: 8332)")
+    parser.add_argument("--data-dir", type=str, default=None, help="Data directory (default: data)")
     parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
     parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")
-    
+
     args = parser.parse_args()
 
     if args.port and not validate_port(args.port):
@@ -342,7 +364,7 @@ def main():
     # After GUI exits, use os._exit to terminate completely
     # We don't need to clean up the event loop as the GUI's on_closing handler already did that
     logger.info("Application exiting")
-    os._exit(0) 
+    network.stop()
 
 if __name__ == "__main__":
     try:

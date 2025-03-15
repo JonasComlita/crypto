@@ -19,20 +19,13 @@ import json
 import threading
 from dataclasses import dataclass
 from blockchain import Blockchain, Block, Transaction
+import subprocess
+from datetime import datetime, timedelta
+import uuid
+from pathlib import Path
 
 # Configure logging
 logger = logging.getLogger("BlockchainNetwork")
-
-# Configuration
-CONFIG = {
-    "sync_interval": 10,           # Seconds between sync attempts
-    "max_peers": 10,               # Maximum number of peers to maintain
-    "peer_discovery_interval": 60, # Seconds between peer discovery cycles
-    "max_retries": 3,              # Retry attempts for failed requests
-    "isolation_timeout": 300,      # Timeout before considering node isolated (seconds)
-    "tls_cert_file": "cert.pem",   # TLS certificate file
-    "tls_key_file": "key.pem"      # TLS key file
-}
 
 async def rate_limit_middleware(app: aiohttp.web.Application, handler: callable) -> callable:
     """Simple rate-limiting middleware (placeholder for expansion)."""
@@ -112,14 +105,287 @@ class NonceTracker:
             self.nonce_map[addr].remove(nonce)
             del self.nonce_expiry[(addr, nonce)]
 
+class NodeIdentity:
+    """Manages persistent node identity across restarts"""
+    
+    def __init__(self, data_dir: str = "data"):
+        self.data_dir = Path(data_dir)
+        self.identity_file = self.data_dir / "node_identity.json"
+        self.node_id = None
+        self.private_key = None
+        self.public_key = None
+        
+    async def initialize(self):
+        """Initialize or load existing node identity"""
+        # Create data directory if it doesn't exist
+        os.makedirs(self.data_dir, exist_ok=True)
+        
+        # Check if identity file exists
+        if self.identity_file.exists():
+            # Load existing identity
+            with open(self.identity_file, 'r') as f:
+                data = json.load(f)
+                self.node_id = data['node_id']
+                self.private_key = data['private_key']
+                self.public_key = data['public_key']
+            logger.info(f"Loaded existing node identity: {self.node_id}")
+        else:
+            # Generate new identity
+            self.node_id = f"node-{uuid.uuid4()}"
+            self.private_key, self.public_key = generate_node_keypair()
+            
+            # Save the identity
+            with open(self.identity_file, 'w') as f:
+                json.dump({
+                    'node_id': self.node_id,
+                    'private_key': self.private_key,
+                    'public_key': self.public_key
+                }, f)
+            logger.info(f"Created new node identity: {self.node_id}")
+        
+        return self.node_id, self.private_key, self.public_key
+    
+class CertificateManager:
+    """Manages SSL certificates with proper validation and rotation"""
+    
+    def __init__(self, node_id: str, host: str, data_dir: str = "data"):
+        self.node_id = node_id
+        self.host = host
+        self.data_dir = Path(data_dir)
+        self.cert_dir = self.data_dir / "certs"
+        self.ca_cert = self.cert_dir / "ca.crt"
+        self.ca_key = self.cert_dir / "ca.key"
+        self.cert_file = self.cert_dir / f"{node_id}.crt"
+        self.key_file = self.cert_dir / f"{node_id}.key"
+        
+    async def initialize(self):
+        """Initialize certificate infrastructure"""
+        # Create certificate directory
+        os.makedirs(self.cert_dir, exist_ok=True)
+        
+        # Create CA if it doesn't exist
+        if not self.ca_cert.exists() or not self.ca_key.exists():
+            await self._create_ca()
+            
+        # Create or renew node certificate
+        if not self.cert_file.exists() or not self.key_file.exists() or await self._is_cert_expired():
+            await self._create_node_cert()
+        
+        # Create SSL contexts
+        server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        server_ctx.load_cert_chain(self.cert_file, self.key_file)
+        
+        client_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        client_ctx.load_verify_locations(self.ca_cert)
+        
+        return server_ctx, client_ctx
+        
+    async def _create_ca(self):
+        """Create a Certificate Authority for the network"""
+        logger.info("Creating Certificate Authority")
+        
+        # Create private key for CA
+        subprocess.run([
+            'openssl', 'genrsa', 
+            '-out', str(self.ca_key),
+            '4096'
+        ], check=True)
+        
+        # Create CA certificate
+        subprocess.run([
+            'openssl', 'req', '-new', '-x509',
+            '-key', str(self.ca_key),
+            '-out', str(self.ca_cert),
+            '-days', '3650',  # 10 years
+            '-subj', f"/CN=OriginalCoin CA"
+        ], check=True)
+        
+        logger.info(f"CA certificate created: {self.ca_cert}")
+        
+    async def _create_node_cert(self):
+        """Create or renew node certificate signed by the CA"""
+        logger.info(f"Creating certificate for node {self.node_id}")
+        
+        # Generate CSR configuration
+        csr_config = self.cert_dir / f"{self.node_id}.cnf"
+        with open(csr_config, 'w') as f:
+            f.write(f"""[req]
+distinguished_name=req
+[san]
+subjectAltName=DNS:{self.host},IP:127.0.0.1
+""")
+            
+        # Create private key
+        subprocess.run([
+            'openssl', 'genrsa',
+            '-out', str(self.key_file),
+            '2048'
+        ], check=True)
+        
+        # Create CSR
+        subprocess.run([
+            'openssl', 'req', '-new',
+            '-key', str(self.key_file),
+            '-out', str(self.cert_dir / f"{self.node_id}.csr"),
+            '-subj', f"/CN={self.node_id}",
+            '-network_config', str(csr_config)
+        ], check=True)
+        
+        # Sign certificate with CA
+        subprocess.run([
+            'openssl', 'x509', '-req',
+            '-in', str(self.cert_dir / f"{self.node_id}.csr"),
+            '-CA', str(self.ca_cert),
+            '-CAkey', str(self.ca_key),
+            '-CAcreateserial',
+            '-out', str(self.cert_file),
+            '-days', '365',  # 1 year
+            '-extensions', 'san',
+            '-extfile', str(csr_config)
+        ], check=True)
+        
+        logger.info(f"Node certificate created: {self.cert_file}")
+    
+    async def _is_cert_expired(self):
+        """Check if the certificate is expired or about to expire"""
+        if not self.cert_file.exists():
+            return True
+            
+        # Get certificate expiration date
+        output = subprocess.check_output([
+            'openssl', 'x509', '-enddate', '-noout',
+            '-in', str(self.cert_file)
+        ]).decode('utf-8')
+        
+        # Parse expiration date
+        expiration_str = output.split('=')[1].strip()
+        expiration_date = datetime.strptime(expiration_str, '%b %d %H:%M:%S %Y %Z')
+        
+        # Renew if less than 30 days until expiration
+        return (expiration_date - datetime.now()) < timedelta(days=30)
+
+def get_default_config() -> dict:
+    """Return default configuration values"""
+    return {
+        "p2p_port": 8333,           # Default Bitcoin P2P port
+        "api_port": 8332,           # Default Bitcoin RPC port 
+        "key_rotation_port": 8334,  # Custom port for key rotation
+        "sync_interval": 10,         
+        "max_peers": 10,            
+        "peer_discovery_interval": 60,
+        "max_retries": 3,           
+        "isolation_timeout": 300,   
+        "data_dir": "data",         # Directory for persistent data
+        "log_level": "INFO",
+        "peer_discovery_enabled": True,
+        "ssl": {
+            "enabled": True,
+            "cert_validity_days": 365,
+            "ca_validity_days": 3650
+        },
+        "bootstrap_nodes": []
+    }
+    
+# Add a configuration loader
+def load_config(config_path: str = "network_config.json") -> dict:
+    """
+    Load configuration from the specified file or create a default one if it doesn't exist.
+    
+    Args:
+        config_path: Path to the configuration file
+        
+    Returns:
+        dict: The loaded configuration
+    """
+    # Get default configuration
+    network_config = get_default_config()
+    
+    # Create network_config directory if it doesn't exist
+    config_dir = os.path.dirname(config_path)
+    if config_dir and not os.path.exists(config_dir):
+        os.makedirs(config_dir, exist_ok=True)
+    
+    # If network_config file exists, load it
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                user_config = json.load(f)
+                
+            # Deep merge configuration
+            def deep_update(d, u):
+                for k, v in u.items():
+                    if isinstance(v, dict) and k in d and isinstance(d[k], dict):
+                        deep_update(d[k], v)
+                    else:
+                        d[k] = v
+                return d
+                
+            network_config = deep_update(network_config, user_config)
+            logger.info(f"Loaded configuration from {config_path}")
+            
+        except json.JSONDecodeError:
+            logger.error(f"Error parsing {config_path}: Invalid JSON format")
+            logger.info(f"Using default configuration")
+            
+        except Exception as e:
+            logger.error(f"Error loading configuration from {config_path}: {str(e)}")
+            logger.info(f"Using default configuration")
+    else:
+        # Create default configuration file
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(network_config, f, indent=2, sort_keys=True)
+            logger.info(f"Created default configuration at {config_path}")
+        except Exception as e:
+            logger.error(f"Error creating default configuration at {config_path}: {str(e)}")
+    
+    return network_config
+
+def save_config(network_config: dict, config_path: str = "network_config.json") -> bool:
+    """
+    Save configuration to the specified file.
+    
+    Args:
+        network_config: Configuration dictionary
+        config_path: Path to save the configuration
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(network_config, f, indent=2, sort_keys=True)
+        logger.info(f"Saved configuration to {config_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving configuration to {config_path}: {str(e)}")
+        return False
+
 class BlockchainNetwork:
     """Manages peer-to-peer networking for the blockchain with enhanced security and reliability."""
     def __init__(self, blockchain: 'Blockchain', node_id: str, host: str, port: int, 
-                 bootstrap_nodes: Optional[List[Tuple[str, int]]] = None, security_monitor=None):
+                 bootstrap_nodes: Optional[List[Tuple[str, int]]] = None, security_monitor=None,
+                 config_path = "network_config.json"):
+        # Load configuration
+        self.config = load_config(config_path)
+        
+        # Use provided port or default from config
+        self.port = port if port is not None else self.config["p2p_port"]
+        self.api_port = self.config["api_port"]
+        self.key_rotation_port = self.config["key_rotation_port"]
+
+        # Initialize node identity
+        self.identity = NodeIdentity(self.config["data_dir"])
+        self.node_id, self.private_key, self.public_key = asyncio.get_event_loop().run_until_complete(
+            self.identity.initialize())
+        
+        # Set up certificate manager
+        self.cert_manager = CertificateManager(self.node_id, host, self.config["data_dir"])
+
         self.blockchain = blockchain
         self.node_id = node_id
         self.host = host
-        self.port = port
+
         self.bootstrap_nodes = bootstrap_nodes or []
         self.security_monitor = security_monitor
         self.shutdown_flag = False
@@ -253,7 +519,7 @@ class BlockchainNetwork:
         
         # Start periodic chain synchronization
         self.sync_task = await self.start_periodic_sync(interval=10)  # Sync every 10 seconds
-        logger.info("Network service started with periodic chain synchronization every 30 seconds")
+        logger.info("Network service started with periodic chain synchronization every 10 seconds")
         
         logger.info("Network service started with automatic chain synchronization")
 
@@ -286,8 +552,11 @@ class BlockchainNetwork:
         logger.info("Network stopped")
 
     async def send_with_retry(self, url: str, data: dict, method: str = "post", 
-                            max_retries: int = CONFIG["max_retries"]) -> Tuple[bool, Optional[dict]]:
+                            max_retries: int = None) -> Tuple[bool, Optional[dict]]:
         """Send HTTP request with retry logic."""
+        if max_retries is None:
+            max_retries = self.config["max_retries"]
+
         # Get auth secret asynchronously
         auth_secret = await PEER_AUTH_SECRET()
         headers = {"Authorization": f"Bearer {auth_secret}"}
@@ -525,7 +794,7 @@ class BlockchainNetwork:
             if (host, port) != (self.host, self.port)
         ]
         random.shuffle(peer_list)
-        limited_list = peer_list[:min(CONFIG["max_peers"], len(peer_list))]
+        limited_list = peer_list[:min(self.config["max_peers"], len(peer_list))]
         return web.json_response(limited_list)
 
     async def discover_peers(self) -> None:
@@ -568,8 +837,8 @@ class BlockchainNetwork:
         
         # Synchronous block to update peers
         with self.lock:
-            if len(self.peers) >= CONFIG["max_peers"] and peer_id not in self.peers:
-                logger.debug(f"Cannot add peer {peer_id}: max peers ({CONFIG['max_peers']}) reached")
+            if len(self.peers) >= self.config["max_peers"] and peer_id not in self.peers:
+                logger.debug(f"Cannot add peer {peer_id}: max peers ({self.config['max_peers']}) reached")
                 return False
             
             peer_key = (host, port)
@@ -605,57 +874,62 @@ class BlockchainNetwork:
             del self.peer_failures[peer_id]
 
     async def request_chain(self):
-        """Request and potentially update the blockchain from peers with improved handling"""
+        """Request and potentially update the blockchain from peers with improved logging"""
         try:
+            logger.info(f"Starting chain request for node {self.node_id}")
+            
             if not self.peers:
-                logger.debug("No peers available for chain request")
-                return
-                
-            logger.info("Requesting chain updates from peers")
+                logger.debug(f"No peers available for chain request on node {self.node_id}")
+                return False
+            
             our_chain_length = len(self.blockchain.chain)
             our_chain_difficulty = self.blockchain.get_total_difficulty()
+            
+            logger.info(f"Node {self.node_id} current chain: length={our_chain_length}, difficulty={our_chain_difficulty}")
+            logger.info(f"Known peers: {list(self.peers.keys())}")
             
             # Track best chain
             best_chain = None
             best_difficulty = our_chain_difficulty
             best_peer = None
             
-            # Check chains from a random selection of peers to reduce network load
+            # Check chains from all peers to reduce network load
             peer_items = list(self.peers.items())
-            random.shuffle(peer_items)
-            sample_size = min(3, len(peer_items))  # Check up to 3 random peers
             
-            for peer_id, peer_data in peer_items[:sample_size]:
+            for peer_id, peer_data in peer_items:
                 try:
                     host = peer_data.get("host", "127.0.0.1")
                     port = peer_data.get("port", 8000)
                     url = f"https://{host}:{port}/get_chain"
+                    
+                    logger.debug(f"Requesting chain from peer {peer_id} at {url}")
                     
                     # Request the chain
                     success, chain_data = await self.send_with_retry(url, {}, method="get")
                     if not success or not chain_data:
                         logger.warning(f"Failed to get chain from peer {peer_id}")
                         continue
-                        
+                    
                     # Convert to Block objects
                     new_chain = [Block.from_dict(block) for block in chain_data]
                     if not new_chain:
+                        logger.warning(f"Peer {peer_id} returned empty chain")
                         continue
-                        
+                    
                     # Calculate difficulty and check if better than current best
                     new_difficulty = sum(block.difficulty for block in new_chain)
                     new_length = len(new_chain)
                     
-                    logger.info(f"Peer {peer_id} has chain with length {new_length} and difficulty {new_difficulty}")
-                    logger.info(f"Our chain has length {our_chain_length} and difficulty {our_chain_difficulty}")
+                    logger.info(f"Peer {peer_id} chain: length={new_length}, difficulty={new_difficulty}")
                     
-                    if new_length > our_chain_length and new_difficulty > best_difficulty:
+                    if new_length > our_chain_length or (new_length == our_chain_length and new_difficulty > our_chain_difficulty):
                         # Validate the chain before accepting it
                         if await self.blockchain.is_valid_chain(new_chain):
                             best_chain = new_chain
                             best_difficulty = new_difficulty
                             best_peer = peer_id
                             logger.info(f"Found better chain from peer {peer_id}: length={new_length}, difficulty={new_difficulty}")
+                            break  # Stop after finding first valid chain
                 except Exception as e:
                     logger.error(f"Error requesting chain from peer {peer_id}: {e}", exc_info=True)
             
@@ -663,7 +937,7 @@ class BlockchainNetwork:
             if best_chain and len(best_chain) > our_chain_length:
                 logger.info(f"Replacing our chain (length={our_chain_length}) with chain from peer {best_peer} (length={len(best_chain)})")
                 if await self.blockchain.replace_chain(best_chain):
-                    logger.info(f"Successfully replaced chain with new chain of length {len(best_chain)}")
+                    logger.info(f"Successfully replaced chain with new chain of length {len(best_chain)} from {best_peer}")
                     
                     # Force balances update in the UI by triggering events for the new blocks
                     for i in range(our_chain_length, len(best_chain)):
@@ -671,13 +945,13 @@ class BlockchainNetwork:
                     
                     return True
                 else:
-                    logger.warning("Failed to replace chain with new chain from peer")
+                    logger.warning(f"Failed to replace chain with new chain from peer {best_peer}")
             else:
                 logger.info("No better chain found from peers")
             
             return False
         except Exception as e:
-            logger.error(f"Chain request error: {e}", exc_info=True)
+            logger.error(f"Comprehensive chain request error: {e}", exc_info=True)
             return False
 
 
@@ -700,7 +974,7 @@ class BlockchainNetwork:
                 await self.discover_peers()
             except Exception as e:
                 logger.error(f"Periodic discovery error: {e}")
-            await asyncio.sleep(CONFIG["peer_discovery_interval"])
+            await asyncio.sleep(self.config["peer_discovery_interval"])
 
     async def start_periodic_sync(self, interval=30):
         """Start periodic chain synchronization"""
@@ -769,6 +1043,20 @@ class BlockchainNetwork:
                     return
 
                 logger.info(f"New connection from {client_ip}")
+
+                # Read first chunk of data to detect protocol
+                initial_data = await reader.read(1024)
+                if not initial_data:
+                    logger.warning(f"Empty initial data from {client_ip}")
+                    return
+                    
+                # Check if this looks like an HTTP request
+                if initial_data.startswith(b'GET') or initial_data.startswith(b'POST') or initial_data.startswith(b'PUT'):
+                    logger.warning(f"Received HTTP request on P2P port from {client_ip}. This connection should go to the HTTP server.")
+                    response = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nThis is a P2P socket server, not an HTTP server."
+                    writer.write(response)
+                    await writer.drain()
+                    return
                 
                 while not self.shutdown_flag:
                     try:
@@ -818,24 +1106,14 @@ class BlockchainNetwork:
                 except Exception as e:
                     logger.error(f"Error closing connection from {client_ip}: {e}")
 
-    async def start_health_server(self):
-        """Start the health check HTTP server"""
-        try:
-            if self.port is None:
-                raise ValueError(f"Cannot start health server: port is None for node {self.node_id}")
-            await self.runner.setup()
-            site = web.TCPSite(self.runner, self.host, self.port + 1)
-            await site.start()
-            logger.info(f"Starting health check server on {self.host}:{self.port + 1}")
-        except Exception as e:
-            logger.error(f"Failed to start health check server: {e}")
-            raise
-
     async def start_server(self):
         """Start both P2P and HTTP servers"""
         if self.loop is None:
             self.loop = asyncio.get_event_loop()
         try:
+            # Initialize certificates
+            self.ssl_context, self.client_ssl_context = await self.cert_manager.initialize()
+            
             # Start P2P server
             self.server = await asyncio.start_server(
                 self.handle_connection,
@@ -845,8 +1123,10 @@ class BlockchainNetwork:
             )
             logger.info(f"Starting P2P server on {self.host}:{self.port}")
 
-            # Start health check server
-            await self.start_health_server()
+            await self.runner.setup()
+            site = web.TCPSite(self.runner, self.host, self.port + 1)
+            await site.start()
+            logger.info(f"Starting HTTP API server with health checkon {self.host}:{self.port + 1}")
             
             # Start serving in the background without awaiting
             asyncio.create_task(self.server_task())
