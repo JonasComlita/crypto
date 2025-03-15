@@ -1,0 +1,19 @@
+{
+  "api_port": 8332,
+  "bootstrap_nodes": [],
+  "data_dir": "data",
+  "isolation_timeout": 300,
+  "key_rotation_port": 8334,
+  "log_level": "INFO",
+  "max_peers": 10,
+  "max_retries": 3,
+  "p2p_port": 8333,
+  "peer_discovery_enabled": true,
+  "peer_discovery_interval": 60,
+  "ssl": {
+    "ca_validity_days": 3650,
+    "cert_validity_days": 365,
+    "enabled": true
+  },
+  "sync_interval": 10
+}

@@ -257,13 +257,7 @@ async def async_main(args, loop, wallet_password: str):
         if args.data_dir:
             config["data_dir"] = args.data_dir
 
-        # Initialize blockchain with node identity
-        node_identity = NodeIdentity(config["data_dir"])
-        node_id, private_key, public_key = await node_identity.initialize()
-        
-        # Initialize blockchain with default password first
-        blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=config["p2p_port"])  # No password yet
-
+        # Initialize network with the correct config
         bootstrap_nodes = []
          # Check for bootstrap nodes from args before defaulting to empty list
         if args.bootstrap:
@@ -281,11 +275,18 @@ async def async_main(args, loop, wallet_password: str):
                 logger.info("Falling back to no bootstrap nodes")
                 bootstrap_nodes = []
 
+        # Initialize blockchain with node identity
+        node_identity = NodeIdentity(config["data_dir"])
+        node_id, private_key, public_key = await node_identity.initialize()
+        
+        # Initialize blockchain with default password first
+        blockchain = Blockchain(node_id=node_id, wallet_password=wallet_password, port=config["p2p_port"])  # No password yet
+        
         security_monitor, mfa_manager, backup_manager = await initialize_security(node_id)
         from utils import rotation_manager
         if not rotation_manager:
             await init_rotation_manager(node_id)  # Initializes global rotation_manager
-        
+
         # Create network with the correct config
         network = BlockchainNetwork(
             blockchain, 
@@ -296,15 +297,45 @@ async def async_main(args, loop, wallet_password: str):
             security_monitor=security_monitor,
             config_path=args.config
         )
+
+        # Manually set the network's private and public keys from node_identity
+        network.private_key = private_key
+        network.public_key = public_key
         network.loop = loop
         
         # Start the network
         network_start_task = asyncio.create_task(network.start())
         
+        key_rotation_port = config["key_rotation_port"]
+        from utils import is_port_available, find_available_port_async
+
+        key_rotation_port = config["key_rotation_port"]
+        if not is_port_available(key_rotation_port, host="127.0.0.1"):
+            logger.warning(f"Key rotation port {key_rotation_port} is already in use.")
+            # Try to find an available port
+            try:
+                # Find the next available port starting from the current one
+                new_port = await find_available_port_async(
+                    start_port=key_rotation_port + 1, 
+                    end_port=key_rotation_port + 100,
+                    host="127.0.0.1"
+                )
+                logger.info(f"Using alternative port {new_port} for key rotation service")
+                key_rotation_port = new_port
+                config["key_rotation_port"] = new_port
+            except Exception as e:
+                logger.error(f"Failed to find available port for key rotation: {e}")
+                # Continue with original port and let the service handle any binding errors
+
+        # Start key rotation with the potentially updated port
         from key_rotation.main import main as rotation_main
         shutdown_event = asyncio.Event()
-        asyncio.create_task(rotation_main(node_id, args.validator, config["key_rotation_port"], "127.0.0.1", loop, shutdown_event))
+        rotation_task = asyncio.create_task(rotation_main(
+            node_id, args.validator, key_rotation_port, "127.0.0.1", loop, shutdown_event))
         
+        # Store tasks in network object for later cleanup
+        network.background_tasks = [network_start_task, rotation_task]
+
         return blockchain, network, security_monitor, mfa_manager, backup_manager, rotation_manager, shutdown_event
     except Exception as e:
         logger.error(f"Error in async initialization: {e}", exc_info=True)
@@ -322,7 +353,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.port and not validate_port(args.port):
+    if args.p2p_port and not validate_port(args.p2p_port):
         logger.error("Invalid port number")
         sys.exit(1)
     if args.bootstrap and not validate_bootstrap_nodes(args.bootstrap):
@@ -331,16 +362,14 @@ def main():
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
+    async_thread.start()
 
     # Create blockchain instance for wallet setup
-    blockchain = Blockchain(node_id=f"node_temp", wallet_password=None, port=args.port)
+    blockchain = Blockchain(node_id=f"node_temp", wallet_password=None, port=args.p2p_port)
     
     # Get wallet password synchronously before starting async loop
     wallet_password = get_wallet_password_synchronous(blockchain)
-
-    # Create the loop and start it in a separate thread
-    async_thread = threading.Thread(target=run_async_loop, args=(loop,), daemon=True)
-    async_thread.start()
     
     # Initialize components asynchronously
     try:
@@ -354,17 +383,17 @@ def main():
     # Create and configure the GUI
     gui = BlockchainGUI(blockchain, network, mfa_manager=mfa_manager, backup_manager=backup_manager)
     gui.loop = loop
-    
-    # Run the GUI
+    gui.loop_thread = async_thread
+
+    # Initialize the GUI after setting up the event loop
     try:
         gui.run()
     except Exception as e:
-        logger.error(f"Error running GUI: {e}", exc_info=True)
-    
-    # After GUI exits, use os._exit to terminate completely
-    # We don't need to clean up the event loop as the GUI's on_closing handler already did that
-    logger.info("Application exiting")
-    network.stop()
+        logger.error(f"Failed to initialize GUI: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        logger.info("Application fully shut down")
+        sys.exit(0)
 
 if __name__ == "__main__":
     try:

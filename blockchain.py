@@ -726,6 +726,11 @@ class AsyncMiner:
                             await self._mining_task
                         except asyncio.CancelledError:
                             pass
+
+                if self._executor:
+                    logger.info("Shutting down mining executor...")
+                    self._executor.shutdown(wait=False)  # Force shutdown of processes
+                logger.info("Miner stopped")
                 
                 # Shut down the process pool
                 self._process_pool.shutdown(wait=False)
@@ -1316,11 +1321,11 @@ class Blockchain:
     async def shutdown(self):
         """Safely shut down the blockchain"""
         try:
-            # Stop mining if active
-            await self.stop_mining()
-            
-            # Stop network
-            await self.network_service.stop()
+            #try:
+            if self.miner:
+                await self.miner.stop_mining()
+            if self.network_service:
+                await self.network_service.stop()
             
             # Save chain and wallets
             await self.save_chain()

@@ -3,7 +3,7 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import time
 from queue import Queue
 from typing import Dict, List, Optional
-from blockchain import Blockchain, Block, Transaction, TransactionType
+from blockchain import Blockchain, Block, Transaction, TransactionType, NetworkService
 from network import BlockchainNetwork
 from utils import SecurityUtils, generate_wallet, derive_key, Fernet
 import logging
@@ -30,17 +30,12 @@ class BlockchainGUI:
         self.mfa_manager = mfa_manager
         self.backup_manager = backup_manager
         self.mining = False
-        self.loop = asyncio.new_event_loop()
-        self.loop_thread = threading.Thread(target=self.main_loop, daemon=True)
-        self.after_ids = []
-        self._shutdown_in_progress = False
-        asyncio.run_coroutine_threadsafe(
-            self.start_network_sync(), self.loop
-        )
+        self._shutdown_in_progress = False  # Add this if not already present
+        self.loop = None  # Will be set by main.py
         
         self.root = tk.Tk()
         self.root.title("OriginalCoin Blockchain")
-        self.root.geometry("800x600")  # Set initial window size
+        self.root.geometry("600x600")  # Set initial window size
 
         # Queue for thread-safe updates
         self.update_queue = queue.Queue()
@@ -124,10 +119,6 @@ class BlockchainGUI:
         # Batch processing
         self.update_batch_size = 100
         self.update_interval = 2000  # 2 seconds
-        
-        # Start the asyncio loop in a separate thread
-        self.loop_thread.start()
-        logger.info("Event loop thread started")
 
     def init_wallet_tab(self):
         """Initialize wallet management tab"""
@@ -187,7 +178,7 @@ class BlockchainGUI:
         amount_entry = ttk.Entry(
             tx_frame,
             textvariable=self.amount_var,
-            width=20
+            width=40
         )
         amount_entry.grid(row=0, column=1, padx=5, pady=5)
         
@@ -379,6 +370,12 @@ class BlockchainGUI:
             # Update node ID
             self.node_id_var.set(f"Node ID: {self.network.node_id}")
 
+            # Check if loop is initialized
+            if not self.loop or not self.loop.is_running():
+                logger.debug("Event loop not ready, scheduling network tab update later")
+                self.root.after(1000, self.update_network_tab)
+                return
+
             # Update peer count and list
             async def fetch_network_data():
                 try:
@@ -427,12 +424,15 @@ class BlockchainGUI:
     async def start_network_sync(self):
         """Start network synchronization"""
         try:
-            # Request immediate chain sync on startup
-            await self.blockchain.sync_with_network()
+            # Check if the loop is set
+            if not self.loop:
+                logger.error("Cannot start network sync: loop not initialized")
+                return
             
-            # Ensure network's periodic sync is running
+            await self.blockchain.sync_with_network()
             if hasattr(self.network, 'start_periodic_sync'):
-                await self.network.start_periodic_sync(interval=30)
+                # Track the periodic sync task
+                self.loop.create_task(self.network.start_periodic_sync(interval=10))
                 logger.info("Started periodic network synchronization")
         except Exception as e:
             logger.error(f"Failed to start network sync: {e}", exc_info=True)
@@ -441,25 +441,19 @@ class BlockchainGUI:
         """Synchronize the blockchain with the network"""
         try:
             self.status_var.set("Syncing with network...")
-            
             async def do_sync():
                 try:
-                    # Request chain updates from network
                     result = await self.blockchain.sync_with_network()
-                    
-                    # Update UI after sync
                     wallet = self.selected_wallet.get()
                     if wallet != "Select Wallet" and wallet:
                         await self.update_async_balance(wallet)
                         await self.update_async_transaction_history(wallet)
-                        
                     self.update_queue.put(lambda: self.status_var.set(
                         "Sync completed" if result else "Sync failed or no updates found"))
                 except Exception as e:
                     logger.error(f"Chain sync error: {e}", exc_info=True)
                     self.update_queue.put(lambda: self.status_var.set(f"Sync error: {str(e)}"))
             
-            # Run the sync operation in the event loop
             asyncio.run_coroutine_threadsafe(do_sync(), self.loop)
         except Exception as e:
             self.show_error(f"Failed to sync chain: {str(e)}")
@@ -926,41 +920,56 @@ class BlockchainGUI:
         """Periodically update the balance and check blockchain status"""
         async def update_chain_info():
             try:
-                # Get current chain status
                 latest_block = self.blockchain.get_latest_block()
                 if latest_block:
-                    # Update status bar with current block height
                     self.update_queue.put(lambda: self.status_var.set(f"Block: {latest_block.index}"))
-
-                # Update balance if wallet is selected
                 wallet = self.selected_wallet.get()
                 if wallet and wallet != "Select Wallet":
-                    try:
-                        # Force a new balance fetch from UTXO set
-                        balance = await self.blockchain.get_balance(wallet)
-                        self.update_queue.put(lambda: self.balance_label.config(text=f"Balance: {balance:.2f} ORIG"))
-                        logger.debug(f"Updated balance for {wallet}: {balance:.2f} ORIG")
-                        
-                        # Periodically request chain sync (10% chance each update)
-                        if random.random() < 0.1:
-                            logger.debug("Triggering chain synchronization")
-                            await self.blockchain.sync_with_network()
-                    except Exception as e:
-                        logger.error(f"Balance update error: {str(e)}")
+                    balance = await self.blockchain.get_balance(wallet)
+                    self.update_queue.put(lambda: self.balance_label.config(text=f"Balance: {balance:.2f} ORIG"))
+                    logger.debug(f"Updated balance for {wallet}: {balance:.2f} ORIG")
+                    if random.random() < 0.1:
+                        logger.debug("Triggering chain synchronization")
+                        await self.blockchain.sync_with_network()
             except Exception as e:
                 logger.error(f"Chain update error: {str(e)}")
-        
-        def schedule_next():
-            if not self._shutdown_in_progress:  # Only schedule if not shutting down
-                future = asyncio.run_coroutine_threadsafe(update_chain_info(), self.loop)
-                after_id = self.root.after(5000, schedule_next)  # Every 5 seconds
-                self.after_ids.append(after_id)
+                self.update_queue.put(lambda: self.show_error(f"Chain update error: {str(e)}"))
 
-        # Start the update cycle
-        if not self._shutdown_in_progress:
-            future = asyncio.run_coroutine_threadsafe(update_chain_info(), self.loop)
-            after_id = self.root.after(5000, schedule_next)
-            self.after_ids.append(after_id)
+        def schedule_next():
+            if not self._shutdown_in_progress:
+                # Check if loop is initialized before scheduling async task
+                if hasattr(self, 'loop') and self.loop is not None:
+                    try:
+                        # Schedule the update
+                        future = asyncio.run_coroutine_threadsafe(update_chain_info(), self.loop)
+                        
+                        # Add done callback to handle potential exceptions
+                        def handle_future_result(fut):
+                            try:
+                                # Retrieve the result to ensure exceptions are raised
+                                fut.result()
+                            except Exception as e:
+                                logger.error(f"Async balance update error: {str(e)}")
+                        
+                        future.add_done_callback(handle_future_result)
+                    except Exception as e:
+                        logger.error(f"Error scheduling async task: {str(e)}")
+                else:
+                    logger.debug("Event loop not ready yet, will retry on next schedule")
+                
+                # Schedule the next call regardless
+                self.root.after(10000, schedule_next)  # 10000 ms = 10 seconds
+            else:
+                logger.info("Shutdown in progress, stopping balance updates")
+
+        try:
+            logger.info("Starting balance update scheduler")
+            # Defer first update slightly to allow loop initialization
+            self.root.after(1000, schedule_next)
+        except Exception as e:
+            logger.error(f"Error starting balance updates: {e}")
+            self.show_error(f"Failed to start balance updates: {e}")
+                
 
     async def update_async_transaction_history(self, address):
         """Update the transaction history asynchronously"""
@@ -1290,117 +1299,56 @@ class BlockchainGUI:
         asyncio.run_coroutine_threadsafe(self.restore_keys(), self.loop)
 
     def on_closing(self):
-        """Handle window closing event with proper cleanup"""
-        logger.info("Window close requested, initiating shutdown")
+        """Handle window closing event with robust cleanup"""
         if self._shutdown_in_progress:
             logger.info("Shutdown already in progress, skipping duplicate call")
             return
         self._shutdown_in_progress = True
         self.status_var.set("Shutting down...")
+        logger.info("Initiating GUI shutdown")
 
-        def shutdown_thread():
-            try:
-                # Run async cleanup - don't wait for result as that's causing issues
-                cleanup_future = asyncio.run_coroutine_threadsafe(self._async_cleanup(), self.loop)
-                
-                # Wait a moment to let cleanup start but don't block
-                time.sleep(2)
-                
-                # Signal the event loop to stop
-                if self.loop.is_running():
-                    self.loop.call_soon_threadsafe(self.loop.stop)
-                
-                # Join the thread with timeout to avoid hanging
-                self.loop_thread.join(timeout=3)
-                if self.loop_thread.is_alive():
-                    logger.warning("Async loop thread did not terminate in time")
-                
-                # Cancel all root.after() callbacks
-                for after_id in self.after_ids:
-                    try:
-                        self.root.after_cancel(after_id)
-                    except Exception:
-                        pass  # Ignore errors during cleanup
-                self.after_ids.clear()
-                
-                # Force GUI exit
-                try:
-                    self.root.quit()
-                    self.root.update()  # Process any remaining Tkinter events
-                    self.root.destroy()
-                except Exception as e:
-                    logger.error(f"Error during GUI shutdown: {e}")
-                
-                logger.info("GUI shutdown completed")
-                
-                # Exit without trying to clean up the event loop further
-                os._exit(0)  # Force exit without more event loop operations
-                
-            except Exception as e:
-                logger.error(f"Shutdown error: {e}", exc_info=True)
-                os._exit(1)  # Force exit on error
+        if self.mining:
+            future = asyncio.run_coroutine_threadsafe(self.blockchain.stop_mining(), self.loop)
+            future.result(timeout=10)
 
-        # Run shutdown in a separate thread
-        threading.Thread(target=shutdown_thread, daemon=True).start()
+        if self.network:
+            future = asyncio.run_coroutine_threadsafe(self.network.stop(), self.loop)
+            future.result(timeout=15)
+            logger.info("Network stopped")
 
-    async def _async_cleanup(self):
-        """Perform asynchronous cleanup tasks"""
-        try:
-            # Stop mining
-            if self.mining:
-                await self.blockchain.stop_mining()
-                logger.info("Mining stopped during shutdown")
+        if hasattr(self.blockchain, 'shutdown'):
+            future = asyncio.run_coroutine_threadsafe(self.blockchain.shutdown(), self.loop)
+            future.result(timeout=10)
 
-            # Stop network
-            if self.network:
-                await self.network.stop()
-                logger.info("Network stopped during shutdown")
-
-            # Shutdown blockchain
-            if hasattr(self.blockchain, 'shutdown'):
-                await self.blockchain.shutdown()
-                logger.info("Blockchain shutdown completed")
-
-            # Cancel all remaining tasks
-            pending = [t for t in asyncio.all_tasks(self.loop) if not t.done()]
-            logger.info(f"Cancelling {len(pending)} pending tasks")
+        async def shutdown_loop():
+            pending = asyncio.all_tasks(self.loop)
+            logger.info(f"Found {len(pending)} pending tasks")
             for task in pending:
-                task.cancel()
+                coro_name = task.get_coro().__qualname__
+                logger.debug(f"Pending task: {coro_name}, done: {task.done()}")
+
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                if not task.done():
+                    coro_name = task.get_coro().__qualname__
+                    logger.debug(f"Cancelling task: {coro_name}")
+                    task.cancel()
+
             if pending:
-                try:
-                    done, still_pending = await asyncio.wait(
-                        pending, timeout=5, return_when=asyncio.ALL_COMPLETED
-                    )
-                    if still_pending:
-                        logger.warning(f"{len(still_pending)} tasks did not complete during shutdown")
-                except Exception as e:
-                    logger.error(f"Task cancellation error: {e}", exc_info=True)
+                done, still_pending = await asyncio.wait(pending, timeout=15)
+                if still_pending:
+                    logger.warning(f"{len(still_pending)} tasks still pending: {[t.get_coro().__qualname__ for t in still_pending]}")
 
-        except Exception as e:
-            logger.error(f"Async cleanup error: {e}", exc_info=True)
-            raise
-
-    def cleanup_resources(self):
-        """Periodic cleanup of resources"""
-        # Clear old cache entries
-        current_time = time.time()
-        self.cache = {k: v for k, v in self.cache.items() 
-                      if current_time - v['timestamp'] < self.cache_timeout}
-        
-        # Clear sensitive data from memory
-        if hasattr(self, 'clear_clipboard'):
-            self.clear_clipboard()
-            
-        # Force garbage collection
-        gc.collect()
-
-    def clear_clipboard(self):
-        """Clear sensitive data from clipboard"""
+        future = asyncio.run_coroutine_threadsafe(shutdown_loop(), self.loop)
         try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append("")
-        except Exception as e:
-            logger.error(f"Failed to clear clipboard: {e}")
+            future.result(timeout=25)
+        except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+            logger.warning("Asyncio shutdown timed out or cancelled")
+
+        self.root.quit()
+        self.root.update()
+        self.root.destroy()
+        logger.info("GUI shutdown completed successfully")
 
     def run(self):
         """Run the GUI with proper initialization"""

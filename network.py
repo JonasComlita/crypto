@@ -210,10 +210,26 @@ class CertificateManager:
         csr_config = self.cert_dir / f"{self.node_id}.cnf"
         with open(csr_config, 'w') as f:
             f.write(f"""[req]
-distinguished_name=req
-[san]
-subjectAltName=DNS:{self.host},IP:127.0.0.1
-""")
+        distinguished_name=req_distinguished_name
+        req_extensions=v3_req
+        prompt=no
+
+        [req_distinguished_name]
+        CN={self.node_id}
+
+        [v3_req]
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature, keyEncipherment
+        extendedKeyUsage=serverAuth
+        subjectAltName=@alt_names
+
+        [alt_names]
+        DNS.1={self.host}
+        IP.1=127.0.0.1
+
+        [san]
+        subjectAltName=DNS:{self.host},IP:127.0.0.1
+        """)
             
         # Create private key
         subprocess.run([
@@ -228,7 +244,7 @@ subjectAltName=DNS:{self.host},IP:127.0.0.1
             '-key', str(self.key_file),
             '-out', str(self.cert_dir / f"{self.node_id}.csr"),
             '-subj', f"/CN={self.node_id}",
-            '-network_config', str(csr_config)
+            '-config', str(csr_config)
         ], check=True)
         
         # Sign certificate with CA
@@ -240,7 +256,7 @@ subjectAltName=DNS:{self.host},IP:127.0.0.1
             '-CAcreateserial',
             '-out', str(self.cert_file),
             '-days', '365',  # 1 year
-            '-extensions', 'san',
+            '-extensions', 'v3_req',
             '-extfile', str(csr_config)
         ], check=True)
         
@@ -374,27 +390,26 @@ class BlockchainNetwork:
         self.api_port = self.config["api_port"]
         self.key_rotation_port = self.config["key_rotation_port"]
 
-        # Initialize node identity
-        self.identity = NodeIdentity(self.config["data_dir"])
-        self.node_id, self.private_key, self.public_key = asyncio.get_event_loop().run_until_complete(
-            self.identity.initialize())
-        
-        # Set up certificate manager
-        self.cert_manager = CertificateManager(self.node_id, host, self.config["data_dir"])
-
         self.blockchain = blockchain
         self.node_id = node_id
         self.host = host
 
+        # Initialize node identity
+        self.identity = NodeIdentity(self.config["data_dir"])
+        
+        # Set up certificate manager
+        self.cert_manager = CertificateManager(self.node_id, host, self.config["data_dir"])
+
         self.bootstrap_nodes = bootstrap_nodes or []
         self.security_monitor = security_monitor
-        self.shutdown_flag = False
+        self.shutdown_flag = asyncio.Event()
         self.loop = None
         self.private_key, self.public_key = generate_node_keypair()
         self.peers = {}
         self.app = web.Application(middlewares=[rate_limit_middleware])
         self.setup_routes()
-        self.sync_task: Optional[asyncio.Task] = None
+        self.sync_task: None
+        self.background_tasks = []
         self.discovery_task: Optional[asyncio.Task] = None
         self.last_announcement = time.time()
         self.peer_failures: Dict[str, int] = defaultdict(int)
@@ -492,7 +507,20 @@ class BlockchainNetwork:
 
     async def start(self):
         """Start the network with automatic synchronization"""
-        self.loop = asyncio.get_event_loop()
+        if self.loop is None:
+            self.loop = asyncio.get_event_loop()
+
+        self.server_task_handle = self.loop.create_task(self.start_server())
+        self.background_tasks.append(self.server_task_handle)
+
+        # Connect to bootstrap nodes
+        for host, port in self.bootstrap_nodes:
+            if (host, port) != (self.host, self.port):  # Don't connect to self
+                peer_id = f"node{port}"
+                logger.info(f"Connecting to bootstrap node {peer_id} at {host}:{port}")
+                auth_secret = await PEER_AUTH_SECRET()
+                await self.add_peer(peer_id, host, port, auth_secret)
+
         # Initialize key rotation manager if needed
         from utils import init_rotation_manager, rotation_manager
         if not rotation_manager:
@@ -506,14 +534,6 @@ class BlockchainNetwork:
         # Start the server tasks
         self.server_task_handle = asyncio.create_task(self.start_server())
 
-        # Connect to bootstrap nodes
-        for host, port in self.bootstrap_nodes:
-            if (host, port) != (self.host, self.port):  # Don't connect to self
-                peer_id = f"node{port}"
-                logger.info(f"Connecting to bootstrap node {peer_id} at {host}:{port}")
-                auth_secret = await PEER_AUTH_SECRET()
-                await self.add_peer(peer_id, host, port, auth_secret)
-        
         # Start peer discovery
         asyncio.create_task(self.discover_peers())
         
@@ -531,7 +551,14 @@ class BlockchainNetwork:
     async def stop(self):
         """Stop the network and cancel background tasks."""
         logger.info("Stopping network...")
+        self.shutdown_flag.set()  # Signal shutdown
         tasks_to_cancel = []
+
+        # Cancel background tasks
+        for task in self.background_tasks:
+            if not task.done():
+                task.cancel()
+                tasks_to_cancel.append(task)
         
         if self.sync_task and not self.sync_task.done():
             tasks_to_cancel.append(self.sync_task)
@@ -549,34 +576,37 @@ class BlockchainNetwork:
         
         if hasattr(self, 'runner'):
             await self.runner.cleanup()
+
+        # Cleanup P2P server
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        
         logger.info("Network stopped")
 
     async def send_with_retry(self, url: str, data: dict, method: str = "post", 
-                            max_retries: int = None) -> Tuple[bool, Optional[dict]]:
+                            max_retries: Optional[int] = None) -> Tuple[bool, Optional[dict]]:
         """Send HTTP request with retry logic."""
         if max_retries is None:
             max_retries = self.config["max_retries"]
 
-        # Get auth secret asynchronously
         auth_secret = await PEER_AUTH_SECRET()
         headers = {"Authorization": f"Bearer {auth_secret}"}
         
-        with ACTIVE_REQUESTS.labels(instance=self.node_id).track_inprogress():
+        async with aiohttp.ClientSession() as session:
             for attempt in range(max_retries):
                 try:
-                    logger.debug(f"Sending {method} request to {url}, attempt {attempt + 1}/{max_retries + 1}")
-                    async with aiohttp.ClientSession() as session:
-                        if method == "post":
-                            async with session.post(url, json=data, headers=headers, 
-                                                  ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                                logger.debug(f"Received response from {url}: status {resp.status}")
-                                return resp.status == 200, None
-                        elif method == "get":
-                            async with session.get(url, headers=headers, 
-                                                 ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                                return resp.status == 200, await resp.json() if resp.status == 200 else None
-                        else:
-                            logger.error(f"Unsupported request method: {method}")
+                    if method == "post":
+                        async with session.post(url, json=data, headers=headers, 
+                                              ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            return resp.status == 200, None
+                    elif method == "get":
+                        async with session.get(url, headers=headers, 
+                                             ssl=self.client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            return resp.status == 200, await resp.json() if resp.status == 200 else None
+                except asyncio.CancelledError:
+                    logger.debug(f"Request to {url} cancelled on attempt {attempt + 1}")
+                    raise
                 except Exception as e:
                     logger.warning(f"Request to {url} failed (attempt {attempt + 1}/{max_retries}): {e}")
                     if attempt == max_retries - 1:
@@ -874,85 +904,64 @@ class BlockchainNetwork:
             del self.peer_failures[peer_id]
 
     async def request_chain(self):
-        """Request and potentially update the blockchain from peers with improved logging"""
-        try:
-            logger.info(f"Starting chain request for node {self.node_id}")
-            
-            if not self.peers:
-                logger.debug(f"No peers available for chain request on node {self.node_id}")
-                return False
-            
-            our_chain_length = len(self.blockchain.chain)
-            our_chain_difficulty = self.blockchain.get_total_difficulty()
-            
-            logger.info(f"Node {self.node_id} current chain: length={our_chain_length}, difficulty={our_chain_difficulty}")
-            logger.info(f"Known peers: {list(self.peers.keys())}")
-            
-            # Track best chain
-            best_chain = None
-            best_difficulty = our_chain_difficulty
-            best_peer = None
-            
-            # Check chains from all peers to reduce network load
-            peer_items = list(self.peers.items())
-            
-            for peer_id, peer_data in peer_items:
-                try:
-                    host = peer_data.get("host", "127.0.0.1")
-                    port = peer_data.get("port", 8000)
-                    url = f"https://{host}:{port}/get_chain"
-                    
-                    logger.debug(f"Requesting chain from peer {peer_id} at {url}")
-                    
-                    # Request the chain
-                    success, chain_data = await self.send_with_retry(url, {}, method="get")
-                    if not success or not chain_data:
-                        logger.warning(f"Failed to get chain from peer {peer_id}")
-                        continue
-                    
-                    # Convert to Block objects
-                    new_chain = [Block.from_dict(block) for block in chain_data]
-                    if not new_chain:
-                        logger.warning(f"Peer {peer_id} returned empty chain")
-                        continue
-                    
-                    # Calculate difficulty and check if better than current best
-                    new_difficulty = sum(block.difficulty for block in new_chain)
-                    new_length = len(new_chain)
-                    
-                    logger.info(f"Peer {peer_id} chain: length={new_length}, difficulty={new_difficulty}")
-                    
-                    if new_length > our_chain_length or (new_length == our_chain_length and new_difficulty > our_chain_difficulty):
-                        # Validate the chain before accepting it
-                        if await self.blockchain.is_valid_chain(new_chain):
-                            best_chain = new_chain
-                            best_difficulty = new_difficulty
-                            best_peer = peer_id
-                            logger.info(f"Found better chain from peer {peer_id}: length={new_length}, difficulty={new_difficulty}")
-                            break  # Stop after finding first valid chain
-                except Exception as e:
-                    logger.error(f"Error requesting chain from peer {peer_id}: {e}", exc_info=True)
-            
-            # If we found a better chain, replace ours
-            if best_chain and len(best_chain) > our_chain_length:
-                logger.info(f"Replacing our chain (length={our_chain_length}) with chain from peer {best_peer} (length={len(best_chain)})")
-                if await self.blockchain.replace_chain(best_chain):
-                    logger.info(f"Successfully replaced chain with new chain of length {len(best_chain)} from {best_peer}")
-                    
-                    # Force balances update in the UI by triggering events for the new blocks
-                    for i in range(our_chain_length, len(best_chain)):
-                        self.blockchain.trigger_event("new_block", best_chain[i])
-                    
-                    return True
-                else:
-                    logger.warning(f"Failed to replace chain with new chain from peer {best_peer}")
-            else:
-                logger.info("No better chain found from peers")
-            
+        """Request and potentially update the blockchain from peers with timeout"""
+        logger.info(f"Starting chain request for node {self.node_id}")
+        
+        if not self.peers:
+            logger.debug(f"No peers available for chain request on node {self.node_id}")
             return False
-        except Exception as e:
-            logger.error(f"Comprehensive chain request error: {e}", exc_info=True)
-            return False
+        
+        our_chain_length = len(self.blockchain.chain)
+        our_chain_difficulty = self.blockchain.get_total_difficulty()
+        
+        best_chain = None
+        best_difficulty = our_chain_difficulty
+        best_peer = None
+        
+        peer_items = list(self.peers.items())
+        for peer_id, peer_data in peer_items:
+            try:
+                host = peer_data.get("host", "127.0.0.1")
+                port = peer_data.get("port", 8000)
+                url = f"https://{host}:{port}/get_chain"
+                
+                logger.debug(f"Requesting chain from peer {peer_id} at {url}")
+                
+                # Wrap send_with_retry in a timeout to ensure it doesn’t hang
+                success, chain_data = await asyncio.wait_for(
+                    self.send_with_retry(url, {}, method="get"),
+                    timeout=10  # Total timeout for this peer request
+                )
+                if not success or not chain_data:
+                    logger.warning(f"Failed to get chain from peer {peer_id}")
+                    continue
+                
+                new_chain = [Block.from_dict(block) for block in chain_data]
+                if not new_chain:
+                    continue
+                
+                new_difficulty = sum(block.difficulty for block in new_chain)
+                new_length = len(new_chain)
+                
+                if new_length > our_chain_length or (new_length == our_chain_length and new_difficulty > our_chain_difficulty):
+                    if await self.blockchain.is_valid_chain(new_chain):
+                        best_chain = new_chain
+                        best_difficulty = new_difficulty
+                        best_peer = peer_id
+                        break
+            except asyncio.TimeoutError:
+                logger.warning(f"Chain request to {peer_id} timed out")
+                self._increment_failure(peer_id)
+            except Exception as e:
+                logger.error(f"Error requesting chain from peer {peer_id}: {e}", exc_info=True)
+        
+        if best_chain and len(best_chain) > our_chain_length:
+            logger.info(f"Replacing chain with length {len(best_chain)} from {best_peer}")
+            if await self.blockchain.replace_chain(best_chain):
+                for i in range(our_chain_length, len(best_chain)):
+                    self.blockchain.trigger_event("new_block", best_chain[i])
+                return True
+        return False
 
 
     async def sync_and_discover(self) -> None:
@@ -977,17 +986,16 @@ class BlockchainNetwork:
             await asyncio.sleep(self.config["peer_discovery_interval"])
 
     async def start_periodic_sync(self, interval=30):
-        """Start periodic chain synchronization"""
+        """Start periodic chain synchronization with proper shutdown handling"""
         logger.info(f"Starting periodic chain sync with interval {interval} seconds")
         
         async def sync_loop():
-            """Run periodic sync loop"""
-            while not self.shutdown_flag:
+            while not self.shutdown_flag.is_set():
                 try:
-                    # Request chain from peers
-                    await self.request_chain()
-                    # Wait for the specified interval
+                    await asyncio.wait_for(self.request_chain(), timeout=interval/2)  # Limit each request duration
                     await asyncio.sleep(interval)
+                except asyncio.TimeoutError:
+                    logger.warning("Chain sync request timed out")
                 except asyncio.CancelledError:
                     logger.info("Periodic sync loop cancelled")
                     break
@@ -995,8 +1003,9 @@ class BlockchainNetwork:
                     logger.error(f"Error in periodic sync: {e}", exc_info=True)
                     await asyncio.sleep(5)  # Short delay before retry
         
-        # Start the loop as a background task
-        return asyncio.create_task(sync_loop())
+        self.sync_task = asyncio.create_task(sync_loop())
+        self.background_tasks.append(self.sync_task)
+        return self.sync_task
 
     def _handle_task_result(self, task: asyncio.Task) -> None:
         """Handle task completion and log exceptions."""
@@ -1114,6 +1123,28 @@ class BlockchainNetwork:
             # Initialize certificates
             self.ssl_context, self.client_ssl_context = await self.cert_manager.initialize()
             
+            # Check if port is already in use or has permission issues
+            from utils import find_available_port_async
+            
+            # Start looking for ports in the unprivileged range (1024+)
+            safe_start_port = max(1024, self.port)
+            
+            logger.info(f"Attempting to find available port starting from {safe_start_port}...")
+            try:
+                # Find an available port in a safer range
+                port_to_use = await find_available_port_async(
+                    start_port=safe_start_port,
+                    end_port=safe_start_port + 1000,
+                    host=self.host
+                )
+                # Update port in the object
+                if port_to_use != self.port:
+                    logger.info(f"Changed port from {self.port} to {port_to_use}")
+                    self.port = port_to_use
+            except Exception as port_error:
+                logger.error(f"Failed to find available port: {port_error}")
+                raise
+                    
             # Start P2P server
             self.server = await asyncio.start_server(
                 self.handle_connection,
@@ -1121,12 +1152,19 @@ class BlockchainNetwork:
                 self.port,
                 ssl=self.ssl_context
             )
-            logger.info(f"Starting P2P server on {self.host}:{self.port}")
+            logger.info(f"Started P2P server on {self.host}:{self.port}")
 
+            # Find an available HTTP port (starting from P2P port + 1)
+            http_port = await find_available_port_async(
+                start_port=self.port + 1,
+                end_port=self.port + 100,
+                host=self.host
+            )
+                
             await self.runner.setup()
-            site = web.TCPSite(self.runner, self.host, self.port + 1)
+            site = web.TCPSite(self.runner, self.host, http_port)
             await site.start()
-            logger.info(f"Starting HTTP API server with health checkon {self.host}:{self.port + 1}")
+            logger.info(f"Started HTTP API server on {self.host}:{http_port}")
             
             # Start serving in the background without awaiting
             asyncio.create_task(self.server_task())
