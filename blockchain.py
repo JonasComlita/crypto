@@ -26,21 +26,14 @@ import tkinter as tk
 from tkinter import ttk
 import multiprocessing
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import sys
-import time
-import json
-import hashlib
-import ecdsa
-import asyncio
 import base64
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
 logger = logging.getLogger("Blockchain")
 
 def _do_mining_work( block_data: dict, difficulty: int) -> Optional[dict]:
@@ -572,7 +565,8 @@ class Mempool:
         self.transactions: Dict[str, Transaction] = {}
         self.timestamps: Dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self.max_size = 1000  # Configurable via environment or config
+        self.max_size = int(os.getenv("MEMPOOL_MAX_SIZE", 1000))  # Configurable via env
+        self.max_age_seconds = int(os.getenv("MEMPOOL_MAX_AGE", 24 * 3600))  # Default: 24 hours
 
     async def add_transaction(self, tx: Transaction) -> bool:
         async with self._lock:
@@ -582,21 +576,20 @@ class Mempool:
                     return False
                     
                 if tx.tx_id not in self.transactions:
-                    # If mempool is full, remove lowest-scoring transaction
                     if len(self.transactions) >= self.max_size:
                         now = time.time()
-                        # Calculate score for fee/size ratio and age
                         tx_scores = {
                             tx_id: (tx.fee / len(json.dumps(tx.to_dict())) * 1000) / (now - self.timestamps[tx_id] + 1)
                             for tx_id, tx in self.transactions.items()
                         }
                         lowest_score_tx = min(tx_scores, key=tx_scores.get)
+                        logger.info(f"Mempool full, dropping lowest-scoring tx {lowest_score_tx} with score {tx_scores[lowest_score_tx]:.2f}")
                         del self.transactions[lowest_score_tx]
                         del self.timestamps[lowest_score_tx]
                     
-                    # Add new transaction
                     self.transactions[tx.tx_id] = tx
                     self.timestamps[tx.tx_id] = time.time()
+                    logger.debug(f"Added transaction {tx.tx_id} to mempool")
                     return True
                 return False
             except Exception as e:
@@ -605,17 +598,14 @@ class Mempool:
 
     async def get_transactions(self, max_txs: int, max_size: int) -> List[Transaction]:
         async with self._lock:
-            # Sort transactions by fee, highest first
-            sorted_txs = sorted(self.transactions.values(), key=lambda tx: tx.fee, reverse=True)
-            
-            # Clean up expired transactions (24 hours old)
             now = time.time()
-            expired = [tx_id for tx_id, ts in self.timestamps.items() if now - ts > 24 * 3600]
+            expired = [tx_id for tx_id, ts in self.timestamps.items() if now - ts > self.max_age_seconds]
             for tx_id in expired:
+                logger.info(f"Removing expired transaction {tx_id} from mempool (age > {self.max_age_seconds}s)")
                 self.transactions.pop(tx_id, None)
                 self.timestamps.pop(tx_id, None)
                 
-            # Return limited number of transactions
+            sorted_txs = sorted(self.transactions.values(), key=lambda tx: tx.fee, reverse=True)
             return sorted_txs[:max_txs]
 
     async def remove_transactions(self, tx_ids: List[str]) -> None:
@@ -999,14 +989,24 @@ class NetworkService:
             except Exception as e:
                 logger.error(f"Failed to broadcast transaction: {e}")
 
-    async def request_chain(self):
-        """Request blockchain from peers"""
-        if self.network:
+    async def request_chain(self, timeout: int = 30, max_retries: int = 3) -> bool:
+        """Request blockchain from peers with timeout and retries"""
+        if not self.network:
+            logger.error("Network not initialized")
+            return False
+
+        for attempt in range(max_retries):
             try:
-                await self.network.request_chain()
-                logger.info("Chain request sent to network")
+                logger.info(f"Requesting chain from network (attempt {attempt + 1}/{max_retries})")
+                await asyncio.wait_for(self.network.request_chain(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(f"Chain request timed out after {timeout}s")
             except Exception as e:
-                logger.error(f"Failed to request chain: {e}")
+                logger.error(f"Chain request failed: {e}")
+            await asyncio.sleep(2)  # Backoff between retries
+        logger.error("Failed to sync chain after all retries")
+        return False
 
     async def _handle_block(self, block_data):
         """Handle received block from network with improved synchronization"""
@@ -1203,15 +1203,17 @@ class Blockchain:
         self.chain: List[Block] = []
 
         # Mining parameters
-        self.difficulty = CONFIG["difficulty"]
-        self.current_reward = CONFIG["current_reward"]
-        self.halving_interval = CONFIG["halving_interval"]
+        self.difficulty = int(os.getenv("INITIAL_DIFFICULTY", CONFIG["difficulty"]))
+        self.current_reward = float(os.getenv("INITIAL_REWARD", CONFIG["current_reward"]))
+        self.halving_interval = int(os.getenv("HALVING_INTERVAL", CONFIG["halving_interval"]))
+        self.difficulty_adjust_interval = int(os.getenv("DIFFICULTY_ADJUST_INTERVAL", 10))  # Default: 10 blocks
         
         # Transaction handling
         self.mempool = Mempool()
         self.utxo_set = UTXOSet()
         self.orphans: Dict[str, Block] = {}
         self.max_orphans = 100
+        self.orphan_expiry_seconds = int(os.getenv("ORPHAN_EXPIRY_SECONDS", 3600))  # 1 hour default
         
         # Concurrency controls
         self._lock = asyncio.Lock()
@@ -1343,7 +1345,7 @@ class Blockchain:
                 async with db.execute('SELECT data FROM blocks ORDER BY id') as cursor:
                     rows = await cursor.fetchall()
                     logger.info(f"Found {len(rows)} blocks in storage")
-                    self.chain = []
+                    self.chain = [Block.from_dict(json.loads(row[0])) for row in rows]
                     if rows:
                         for i, row in enumerate(rows):
                             try:
@@ -1403,27 +1405,36 @@ class Blockchain:
         return genesis_block
 
     async def save_chain(self):
+        """Save chain incrementally with backup"""
         try:
             async with aiosqlite.connect(self.storage_path) as db:
                 await db.execute('''
                     CREATE TABLE IF NOT EXISTS blocks (
                         id INTEGER PRIMARY KEY,
-                        data TEXT NOT NULL
+                        data TEXT NOT NULL,
+                        timestamp REAL NOT NULL
                     )
                 ''')
-                await db.execute('DELETE FROM blocks')
-                for block in self.chain:
-                    await db.execute('INSERT INTO blocks (data) VALUES (?)', (json.dumps(block.to_dict()),))
-                await db.commit()
-                # Verify the save
-                async with db.execute('SELECT COUNT(*) FROM blocks') as cursor:
-                    count = (await cursor.fetchone())[0]
-                    if count != len(self.chain):
-                        logger.error(f"Save verification failed: {count} blocks in DB, {len(self.chain)} in memory")
-                        raise RuntimeError("Chain save incomplete")
-                logger.info(f"Saved {len(self.chain)} blocks to {self.storage_path}")
+                current_ids = set()
+                async with db.execute('SELECT id FROM blocks') as cursor:
+                    current_ids = {row[0] for row in await cursor.fetchall()}
+
+                new_blocks = [b for b in self.chain if b.index not in current_ids]
+                if new_blocks:
+                    for block in new_blocks:
+                        await db.execute(
+                            'INSERT OR REPLACE INTO blocks (id, data, timestamp) VALUES (?, ?, ?)',
+                            (block.index, json.dumps(block.to_dict()), self._block_timestamp_to_seconds(block.timestamp))
+                        )
+                    await db.commit()
+                    logger.info(f"Appended {len(new_blocks)} new blocks to {self.storage_path}")
+
+                if self.backup_manager and len(self.chain) % 100 == 0:  # Backup every 100 blocks
+                    backup_path = f"backup_chain_{self.node_id}_{len(self.chain)}.db"
+                    await self.backup_manager.backup(self.storage_path, backup_path)
+                    logger.info(f"Created chain backup at {backup_path}")
         except Exception as e:
-            logger.error(f"Failed to save chain to {self.storage_path}: {e}", exc_info=True)
+            logger.error(f"Failed to save chain: {e}", exc_info=True)
             raise
 
     # Update the wallet handling methods in Blockchain class
@@ -1512,14 +1523,14 @@ class Blockchain:
             try:
                 logger.info(f"Starting validation for block {block.index}")
                 # Check block is properly linked to chain
+                logger.info(f"Starting validation for block {block.index}")
                 if block.index > 0:
                     if block.index > len(self.chain):
                         logger.info(f"Block {block.hash[:8]} index {block.index} exceeds chain length {len(self.chain)} - potential orphan")
                         return False
-                        
                     prev_block = self.chain[block.index - 1]
                     if block.previous_hash != prev_block.hash:
-                        logger.warning(f"Block {block.index} has incorrect previous_hash")
+                        logger.warning(f"Block {block.index} has incorrect previous_hash: expected {prev_block.hash[:8]}, got {block.previous_hash[:8]}")
                         return False
                 
                 # Validate timestamp (not in future, after previous block)
@@ -1693,48 +1704,49 @@ class Blockchain:
         await self.mempool.remove_transactions(tx_ids)
 
     async def _process_orphans(self):
-        """Process orphan blocks that might now fit in the chain"""
+        """Process orphan blocks iteratively"""
         async with self._lock:
-            for hash, orphan in list(self.orphans.items()):
-                if orphan.previous_hash == self.chain[-1].hash and orphan.index == len(self.chain):
-                    if await self.validate_block(orphan):
-                        self.chain.append(orphan)
-                        await self.utxo_set.update_with_block(orphan)
-                        self.trigger_event("new_block", orphan)
-                        await self.save_chain()
-                        await self.update_metrics()
-                        del self.orphans[hash]
-                        # Recursively process any additional orphans
-                        await self._process_orphans()
-                        break
+            while True:
+                processed = False
+                for hash in list(self.orphans.keys()):
+                    orphan = self.orphans[hash]
+                    if orphan.previous_hash == self.chain[-1].hash and orphan.index == len(self.chain):
+                        if await self.validate_block(orphan):
+                            self.chain.append(orphan)
+                            await self.utxo_set.update_with_block(orphan)
+                            self.trigger_event("new_block", orphan)
+                            await self.save_chain()
+                            await self.update_metrics()
+                            del self.orphans[hash]
+                            logger.info(f"Processed orphan block {orphan.index} into chain")
+                            processed = True
+                if not processed:
+                    break
+    
+    def _block_timestamp_to_seconds(self, timestamp) -> float:
+        """Convert block timestamp to seconds for expiration check"""
+        if isinstance(timestamp, str):
+            return datetime.datetime.fromisoformat(timestamp).timestamp()
+        return float(timestamp)
 
     def adjust_difficulty(self) -> int:
         """Adjust mining difficulty based on block generation time"""
-        if len(self.chain) % 2016 == 0 and len(self.chain) > 1:
-            # Get blocks from the current period
-            period_blocks = self.chain[-2016:]
-            
-            # Calculate time taken to mine these blocks
-            if isinstance(period_blocks[0].timestamp, str) and isinstance(period_blocks[-1].timestamp, str):
-                # ISO format timestamps
-                start_time = datetime.datetime.fromisoformat(period_blocks[0].timestamp)
-                end_time = datetime.datetime.fromisoformat(period_blocks[-1].timestamp)
-                time_taken = (end_time - start_time).total_seconds()
-            else:
-                # Epoch timestamps
-                time_taken = period_blocks[-1].timestamp - period_blocks[0].timestamp
-                
-            # Target time for 2016 blocks (10 minutes per block)
-            target_time = 2016 * 600  # seconds
-            
-            if time_taken > 0:
-                # Calculate ratio of expected time to actual time
-                ratio = target_time / time_taken
-                
-                # Adjust difficulty (with limits)
-                self.difficulty = max(1, min(20, int(self.difficulty * ratio)))
-                logger.info(f"Difficulty adjusted to {self.difficulty}")
-                
+        if len(self.chain) < 2 or len(self.chain) % self.difficulty_adjust_interval != 0:
+            return self.difficulty
+
+        period_blocks = self.chain[-self.difficulty_adjust_interval:]
+        if isinstance(period_blocks[0].timestamp, str):
+            start_time = datetime.datetime.fromisoformat(period_blocks[0].timestamp)
+            end_time = datetime.datetime.fromisoformat(period_blocks[-1].timestamp)
+            time_taken = (end_time - start_time).total_seconds()
+        else:
+            time_taken = period_blocks[-1].timestamp - period_blocks[0].timestamp
+
+        target_time = self.difficulty_adjust_interval * 600  # 10 minutes/block
+        if time_taken > 0:
+            ratio = target_time / time_taken
+            self.difficulty = max(1, min(20, int(self.difficulty * ratio)))
+            logger.info(f"Difficulty adjusted to {self.difficulty} after {self.difficulty_adjust_interval} blocks (time taken: {time_taken}s)")
         return self.difficulty
 
     def dynamic_difficulty(self) -> int:
@@ -1793,72 +1805,56 @@ class Blockchain:
         logger.info(f"Block reward halved to {self.current_reward}")
 
     async def handle_potential_fork(self, block: Block) -> None:
-        """Handle a block that might be part of a fork"""
         async with self._lock:
-            # Ignore old blocks
             if block.index <= len(self.chain) - 1:
                 return
-                
-            # Add to orphans if it's ahead of our chain
             if block.index > len(self.chain):
-                # Remove oldest orphan if we're at capacity
                 if len(self.orphans) >= self.max_orphans:
-                    oldest = min(self.orphans.keys(), key=lambda k: self.orphans[k].timestamp)
-                    del self.orphans[oldest]
-                    
-                # Add new orphan
+                    now = time.time()
+                    expired = [h for h, b in self.orphans.items() if now - self._block_timestamp_to_seconds(b.timestamp) > self.orphan_expiry_seconds]
+                    for h in expired:
+                        logger.info(f"Removing expired orphan block {self.orphans[h].index} (hash: {h[:8]})")
+                        del self.orphans[h]
+                    if len(self.orphans) >= self.max_orphans:
+                        oldest = min(self.orphans.keys(), key=lambda k: self._block_timestamp_to_seconds(self.orphans[k].timestamp))
+                        logger.info(f"Orphan pool full, removing oldest {self.orphans[oldest].index} (hash: {oldest[:8]})")
+                        del self.orphans[oldest]
                 self.orphans[block.hash] = block
                 logger.info(f"Added block {block.index} to orphan pool: {block.hash[:8]}")
-                
-            # Request missing blocks from network
-            if self.network_service:
-                await self.network_service.request_chain()
+            await self.network_service.request_chain()
 
     async def replace_chain(self, new_chain: List[Block]) -> bool:
-        """Replace the current chain with a longer, valid chain with proper UTXO handling"""
         async with self._lock:
             try:
-                # New chain must be longer than current chain
                 if len(new_chain) <= len(self.chain):
-                    logger.info(f"New chain length {len(new_chain)} not longer than current chain length {len(self.chain)}")
+                    logger.info(f"New chain length {len(new_chain)} not longer than current chain {len(self.chain)}")
                     return False
-                    
-                # New chain must be valid
+
+                new_total_difficulty = sum(block.difficulty for block in new_chain)
+                current_total_difficulty = self.get_total_difficulty()
+                if new_total_difficulty <= current_total_difficulty:
+                    logger.info(f"New chain difficulty {new_total_difficulty} not greater than current {current_total_difficulty}")
+                    return False
+
                 if await self.is_valid_chain(new_chain):
-                    logger.info(f"Replacing chain of length {len(self.chain)} with new chain of length {len(new_chain)}")
-                    
-                    # Store old chain for reversion if needed
+                    logger.info(f"Replacing chain: length {len(self.chain)}→{len(new_chain)}, difficulty {current_total_difficulty}→{new_total_difficulty}")
                     old_chain = self.chain.copy()
-                    
                     try:
-                        # Replace chain
                         self.chain = new_chain
-                        
-                        # Rebuild UTXO set completely from scratch to ensure consistency
-                        logger.info("Rebuilding UTXO set with new chain")
                         await self._rebuild_utxo_set()
-                        
-                        # Save to storage
                         await self.save_chain()
-                        
-                        # Update metrics
                         await self.update_metrics()
-                        
-                        # Notify listeners about new blocks
-                        # This ensures the GUI updates to show the new chain state
                         for i in range(len(old_chain), len(new_chain)):
                             self.trigger_event("new_block", new_chain[i])
-                        
-                        logger.info(f"Chain replacement complete. Now at block {len(self.chain)-1}")
+                        logger.info(f"Chain replaced successfully to height {len(self.chain)-1}")
                         return True
                     except Exception as e:
-                        # If something goes wrong, revert to old chain
-                        logger.error(f"Error during chain replacement: {e}")
+                        logger.error(f"Chain replacement failed: {e}")
                         self.chain = old_chain
-                        await self._rebuild_utxo_set()  # Rebuild UTXO set with old chain
+                        await self._rebuild_utxo_set()
                         return False
                 else:
-                    logger.warning("Received chain is invalid, rejecting")
+                    logger.warning("New chain is invalid")
                     return False
             except Exception as e:
                 logger.error(f"Chain replacement error: {e}", exc_info=True)
@@ -2190,12 +2186,15 @@ class Blockchain:
             self._logger.error("No wallet address set for mining")
             return False
 
-        # Force synchronization before starting mining
+        # Force comprehensive synchronization before starting mining
         self._logger.info("Synchronizing with network before starting mining...")
         try:
-            # Call network synchronization through network service
-            if self.network_service:
-                await self.network_service.request_chain()
+            # Use sync_with_network instead of just request_chain for more thorough sync
+            await self.sync_with_network()
+            
+            # Log the current blockchain state after sync
+            latest_block = self.get_latest_block()
+            self._logger.info(f"After sync: current blockchain height is {latest_block.index}")
         except Exception as sync_error:
             self._logger.error(f"Network sync failed before mining: {sync_error}")
         
@@ -2204,7 +2203,7 @@ class Blockchain:
             self._logger.error("Cannot start mining: blockchain has no blocks")
             return False
 
-        self._logger.info(f"Starting mining for wallet {wallet_address}")
+        self._logger.info(f"Starting mining for wallet {wallet_address} from block #{self.get_latest_block().index + 1}")
         
         try:
             # Start mining using the miner's method
@@ -2212,6 +2211,10 @@ class Blockchain:
             
             if result:
                 self._logger.info(f"Mining started successfully for {wallet_address}")
+                
+                # Start periodic chain updates while mining
+                asyncio.create_task(self._periodic_chain_check())
+                
                 return True
             else:
                 self._logger.error("Failed to start mining")
@@ -2219,6 +2222,19 @@ class Blockchain:
         except Exception as e:
             self._logger.error(f"Mining start error: {str(e)}", exc_info=True)
             return False
+
+    async def _periodic_chain_check(self, interval=30):
+        """Periodically check for chain updates while mining."""
+        while self.miner.mining:
+            try:
+                # Sync with network but don't stop mining if sync fails
+                sync_result = await self.sync_with_network()
+                if sync_result:
+                    self._logger.info("Updated blockchain from network while mining")
+            except Exception as e:
+                self._logger.error(f"Periodic chain check failed: {e}")
+            
+            await asyncio.sleep(interval)
 
     async def stop_mining(self) -> bool:
         """Stop the mining process"""
@@ -2253,24 +2269,20 @@ class Blockchain:
             raise
 
     
-    async def sync_with_network(self):
-        """Force a comprehensive synchronization with the network"""
+    async def sync_with_network(self) -> bool:
+        """Force comprehensive synchronization with timeout"""
         if self.network_service:
-            logger.info("Initiating comprehensive blockchain synchronization")
+            logger.info("Initiating blockchain synchronization")
             try:
-                # Attempt to sync the chain
-                sync_result = await self.network_service.request_chain()
-                
-                # If sync was successful and chain changed, rebuild UTXO set
-                if sync_result:
+                success = await self.network_service.request_chain(timeout=30, max_retries=3)
+                if success:
                     await self._rebuild_utxo_set()
-                    logger.info("Network sync completed successfully")
+                    logger.info("Network sync completed")
                     return True
-                
-                logger.info("No updates found during network sync")
+                logger.info("No updates from network sync")
                 return False
             except Exception as e:
-                logger.error(f"Network synchronization error: {e}")
+                logger.error(f"Network sync error: {e}")
                 return False
 
 class ResourceMonitor:

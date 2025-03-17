@@ -16,56 +16,62 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
 from aiohttp import ClientSession, ClientTimeout
 from security import KeyBackupManager
+from dotenv import load_dotenv
+from blockchain import Blockchain
 
 logger = logging.getLogger(__name__)
 
-KEY_ROTATION_INTERVAL_DAYS = 30
-CERT_VALIDITY_DAYS = 365
-VOTE_THRESHOLD_PERCENT = 66
-VOTE_TIMEOUT_HOURS = 48
+load_dotenv()
+KEY_ROTATION_INTERVAL_DAYS = int(os.getenv("KEY_ROTATION_INTERVAL_DAYS", 30))
+CERT_VALIDITY_DAYS = int(os.getenv("CERT_VALIDITY_DAYS", 365))
+VOTE_THRESHOLD_PERCENT = float(os.getenv("VOTE_THRESHOLD_PERCENT", 66))
+VOTE_TIMEOUT_HOURS = int(os.getenv("VOTE_TIMEOUT_HOURS", 48))
+BACKUP_PASSWORD = os.getenv("BACKUP_PASSWORD")  # Set in .env or prompt in production
 
 class SecureStorage:
-    """In-memory secure storage with optional encryption."""
-    def __init__(self):
+    def __init__(self, backup_dir: str = "data/key_storage"):
         self._data: Dict[str, Dict[str, str]] = {}
         self._lock = asyncio.Lock()
         self._fernet = Fernet(base64.urlsafe_b64encode(os.urandom(32)))
+        self._backup_dir = backup_dir
+        os.makedirs(backup_dir, exist_ok=True)
+        asyncio.create_task(self._load_from_disk())  # Load at startup
 
     async def store(self, key: str, value: str, namespace: str = "default") -> None:
-        """Store a value securely."""
         async with self._lock:
-            try:
-                if namespace not in self._data:
-                    self._data[namespace] = {}
-                encrypted_value = self._fernet.encrypt(value.encode()).decode()
-                self._data[namespace][key] = encrypted_value
-                logger.debug(f"Stored {key} in namespace {namespace}")
-            except Exception as e:
-                logger.error(f"Failed to store {key}: {e}")
-                raise
+            if namespace not in self._data:
+                self._data[namespace] = {}
+            encrypted_value = self._fernet.encrypt(value.encode()).decode()
+            self._data[namespace][key] = encrypted_value
+            await self._save_to_disk()
 
     async def retrieve(self, key: str, namespace: str = "default") -> Optional[str]:
-        """Retrieve a value from secure storage."""
         async with self._lock:
-            try:
-                if namespace in self._data and key in self._data[namespace]:
-                    encrypted_value = self._data[namespace][key]
-                    return self._fernet.decrypt(encrypted_value.encode()).decode()
-                return None
-            except Exception as e:
-                logger.error(f"Failed to retrieve {key}: {e}")
-                return None
+            if namespace in self._data and key in self._data[namespace]:
+                return self._fernet.decrypt(self._data[namespace][key].encode()).decode()
+            return None
 
     async def delete(self, key: str, namespace: str = "default") -> None:
-        """Delete a value from secure storage."""
         async with self._lock:
-            try:
-                if namespace in self._data and key in self._data[namespace]:
-                    del self._data[namespace][key]
-                    logger.debug(f"Deleted {key} from namespace {namespace}")
-            except Exception as e:
-                logger.error(f"Failed to delete {key}: {e}")
-                raise
+            if namespace in self._data and key in self._data[namespace]:
+                del self._data[namespace][key]
+                await self._save_to_disk()
+
+    async def _save_to_disk(self) -> None:
+        try:
+            with open(os.path.join(self._backup_dir, "storage.enc"), "wb") as f:
+                f.write(self._fernet.encrypt(json.dumps(self._data).encode()))
+        except Exception as e:
+            logger.error(f"Failed to save storage: {e}")
+
+    async def _load_from_disk(self) -> None:
+        try:
+            file_path = os.path.join(self._backup_dir, "storage.enc")
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    self._data = json.loads(self._fernet.decrypt(f.read()).decode())
+        except Exception as e:
+            logger.error(f"Failed to load storage: {e}")
 
 class PKIManager:
     """Manages PKI certificates and keys."""
@@ -355,13 +361,10 @@ class P2PNetwork:
             raise
 
     async def stop(self) -> None:
-        """Stop the P2P network."""
-        try:
-            if self._session:
-                await self._session.close()
-            logger.info("P2P network stopped")
-        except Exception as e:
-            logger.error(f"Failed to stop P2P network: {e}")
+        if self._session:
+            await self._session.close()
+        self._message_cache.clear()
+        logger.info("P2P network stopped")
 
     async def broadcast_proposal(self, proposal_id: str) -> bool:
         """Broadcast a new proposal."""
@@ -466,10 +469,11 @@ class P2PNetwork:
 
 class KeyRotationManager:
     """Manages secure key rotation with PKI and distributed consensus."""
-    def __init__(self, node_id: str, is_validator: bool = False, backup_manager=None):
+    def __init__(self, node_id: str, is_validator: bool = False, backup_manager: Optional[KeyBackupManager] = None, blockchain: Blockchain = None):
         self.node_id = node_id
         self.is_validator = is_validator
         self.backup_manager = backup_manager
+        self.blockchain = blockchain
         self._secure_storage = SecureStorage()
         self._pki = PKIManager(self.node_id)
         self._node_registry = NodeRegistry()
@@ -481,30 +485,25 @@ class KeyRotationManager:
         self._pending_proposal_id: Optional[str] = None
         self._lock = asyncio.Lock()
         self._running = False
+        self._scheduler_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
-        """Start the key rotation manager."""
-        try:
-            # Load or initialize secrets immediately
-            await self._load_auth_secrets()
-            # Ensure P2P network starts after secrets are loaded
-            await self._p2p.start()
-            self._running = True
-            # Start scheduler in the background
-            asyncio.create_task(self._run_scheduler())
-            logger.info(f"KeyRotationManager started for node {self.node_id} with auth secret initialized")
-        except Exception as e:
-            logger.error(f"Failed to start KeyRotationManager: {e}")
-            raise
+        await self._load_auth_secrets()
+        await self._p2p.start()
+        self._running = True
+        self._scheduler_task = asyncio.create_task(self._run_scheduler())
+        logger.info(f"KeyRotationManager started for node {self.node_id}")
 
     async def stop(self) -> None:
-        """Stop the key rotation manager."""
-        try:
-            self._running = False
-            await self._p2p.stop()
-            logger.info("KeyRotationManager stopped")
-        except Exception as e:
-            logger.error(f"Failed to stop KeyRotationManager: {e}")
+        self._running = False
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+        await self._p2p.stop()
+        logger.info("KeyRotationManager stopped")
 
     async def _load_auth_secrets(self) -> None:
         """Load or initialize authentication secrets."""
@@ -591,7 +590,6 @@ class KeyRotationManager:
                 logger.error(f"Failed to check proposals: {e}")
 
     async def apply_key_rotation(self) -> None:
-        """Apply a finalized key rotation."""
         async with self._lock:
             try:
                 if not self._pending_auth_secret or not self._pending_proposal_id:
@@ -605,6 +603,8 @@ class KeyRotationManager:
                 await self._secure_storage.delete("pending_proposal_id")
                 self._pending_auth_secret = None
                 self._pending_proposal_id = None
+                if self.blockchain:
+                    await self.blockchain.trigger_event("key_rotated", {"new_key_hash": self.hash_secret(self._current_auth_secret)})
                 logger.info("Applied key rotation")
             except Exception as e:
                 logger.error(f"Failed to apply key rotation: {e}")
@@ -679,31 +679,47 @@ class KeyRotationManager:
                 logger.error(f"Failed to propose key rotation: {e}")
                 return None
 
-    async def rotate_keys(self):
+    async def rotate_keys(self) -> None:
         """Rotate keys with automatic backup"""
-        try:
-            # ... existing key rotation logic ...
-            
-            # If backup manager is available, backup the new keys
-            if self.backup_manager:
-                try:
+        async with self._lock:
+            try:
+                if not self._pending_auth_secret or not self._pending_proposal_id:
+                    logger.error("No pending rotation to apply")
+                    return
+                self._previous_auth_secret = self._current_auth_secret
+                self._current_auth_secret = self._pending_auth_secret
+                await self._secure_storage.store("previous_auth_secret", self._previous_auth_secret)
+                await self._secure_storage.store("current_auth_secret", self._current_auth_secret)
+                await self._secure_storage.store("last_rotation_time", str(time.time()))
+                await self._secure_storage.delete("pending_auth_secret")
+                await self._secure_storage.delete("pending_proposal_id")
+                if self.backup_manager:
+                    password = BACKUP_PASSWORD or await self.get_backup_password()
                     await self.backup_manager.create_backup(
                         keys={
-                            'public_key': self._pki.get_public_key_pem(),
-                            'private_key': self._pki.decrypt_message(await self._secure_storage.retrieve("current_auth_secret")),
-                            'rotation_time': datetime.utcnow().isoformat()
+                            "public_key": self._pki.get_public_key_pem(),
+                            "private_key": self._pki._private_key.private_bytes(
+                                encoding=serialization.Encoding.PEM,
+                                format=serialization.PrivateFormat.PKCS8,
+                                encryption_algorithm=serialization.NoEncryption()
+                            ).decode(),
+                            "rotation_time": datetime.utcnow().isoformat()
                         },
-                        password=self.get_backup_password()
+                        password=password
                     )
-                except Exception as e:
-                    logger.error(f"Failed to backup keys: {e}")
-            
-        except Exception as e:
-            logger.error(f"Key rotation failed: {e}")
-            raise
+                self._pending_auth_secret = None
+                self._pending_proposal_id = None
+                if self.blockchain:
+                    await self.blockchain.trigger_event("key_rotated", {"new_key_hash": self.hash_secret(self._current_auth_secret)})
+                logger.info("Keys rotated and backed up")
+            except Exception as e:
+                logger.error(f"Key rotation failed: {e}")
+                raise
 
     async def get_backup_password(self) -> str:
-        """Get password for key backup"""
-        # In a production environment, this should be securely configured
-        # For now, we'll use a simple derived password
-        return hashlib.sha256(f"{self.node_id}_backup".encode()).hexdigest()
+        """Prompt for backup password in production if not set in env"""
+        if "pytest" in sys.modules:  # For testing
+            return "test_password"
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: input("Enter backup password: "))
+

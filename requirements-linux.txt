@@ -8,6 +8,10 @@ qrcode>=7.3.1
 ecdsa>=0.18.0
 base58>=2.1.1
 
+# Web Framework
+flask>=2.0.0
+flask_limiter>=2.8.0
+
 # Monitoring & Logging
 prometheus_client>=0.17.0
 structlog>=23.1.0
@@ -16,6 +20,9 @@ prometheus-async>=22.1.0
 # Utilities
 python-dateutil>=2.8.2
 typing-extensions>=4.5.0
+jsonschema>=4.17.3
+resource
+msgpack>=1.0.5
 
 # Testing & Development - Linux-specific versions
 pytest>=7.3.1

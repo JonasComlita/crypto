@@ -8,6 +8,10 @@ qrcode>=7.3.1
 ecdsa>=0.18.0
 base58>=2.1.1
 
+# Web Framework
+flask>=2.0.0
+flask_limiter>=2.8.0
+
 # Monitoring & Logging
 prometheus_client>=0.17.0
 structlog>=23.1.0
@@ -16,11 +20,16 @@ prometheus-async>=22.1.0
 # Utilities
 python-dateutil>=2.8.2
 typing-extensions>=4.5.0
+jsonschema>=4.17.3
+psutil>=5.9.0
+msgpack>=1.0.5
 
 # Testing & Development - Windows-specific versions
 pytest>=7.3.1
 pytest-asyncio>=0.25.0
 pytest-cov>=6.0.0
+
+# Development Tools
 black>=25.1.0; platform_system=="Windows"
 mypy>=1.15.0; platform_system=="Windows"
 pylint>=3.3.0
