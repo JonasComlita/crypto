@@ -1,0 +1,44 @@
+cmake_minimum_required(VERSION 3.10)
+project(blockchain_cpp)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Find Python and pybind11
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+
+# Check for CUDA
+option(WITH_CUDA "Build with CUDA support" OFF)
+if(WITH_CUDA)
+    find_package(CUDA)
+    if(CUDA_FOUND)
+        enable_language(CUDA)
+        add_definitions(-DWITH_CUDA)
+        include_directories(${CUDA_INCLUDE_DIRS})
+        message(STATUS "CUDA found, enabling GPU mining support")
+    else()
+        message(WARNING "CUDA requested but not found, building without GPU support")
+        set(WITH_CUDA OFF)
+    endif()
+endif()
+
+# Add the pybind11 module
+pybind11_add_module(blockchain_cpp blockchain_cpp.cpp)
+
+# Link against OpenSSL
+target_link_libraries(blockchain_cpp PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+# If CUDA is enabled, link against CUDA libraries
+if(WITH_CUDA)
+    target_link_libraries(blockchain_cpp PRIVATE ${CUDA_LIBRARIES})
+endif()
+
+# Installation settings
+install(TARGETS blockchain_cpp
+        LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX})

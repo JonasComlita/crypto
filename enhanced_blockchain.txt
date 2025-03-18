@@ -1,0 +1,1534 @@
+"""
+Enhanced Blockchain implementation with PostgreSQL, msgpack, and C++ acceleration.
+"""
+
+import os
+import sys
+import asyncio
+import logging
+import time
+import datetime
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
+import uuid
+import base64
+import hashlib
+import json
+import msgpack
+from enum import Enum
+from dataclasses import dataclass, field, asdict
+
+# Import acceleration modules
+from cpp_utils import (
+    sha256,
+    calculate_merkle_root,
+    public_key_to_address
+)
+
+# Import storage and serialization
+from postgres_storage import BlockchainStorage, initialize_database
+from msgpack_serializer import serialize, deserialize, serialize_block, deserialize_block
+
+# Import mining worker
+from mining_worker import MultiprocessMiner
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# From utils.py, maintain TransactionType enum
+class TransactionType(Enum):
+    """Enum representing types of transactions."""
+    COINBASE = "coinbase"
+    TRANSFER = "transfer"
+
+@dataclass
+class TransactionOutput:
+    """Represents an output in a transaction."""
+    recipient: str
+    amount: float
+    script: str = "P2PKH"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "recipient": self.recipient,
+            "amount": self.amount,
+            "script": self.script
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TransactionOutput':
+        return cls(
+            recipient=data["recipient"],
+            amount=data["amount"],
+            script=data.get("script", "P2PKH")
+        )
+
+@dataclass
+class TransactionInput:
+    """Represents an input in a transaction."""
+    tx_id: str
+    output_index: int
+    public_key: Optional[str] = None
+    signature: Optional[bytes] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tx_id": self.tx_id,
+            "output_index": self.output_index,
+            "public_key": self.public_key,
+            "signature": self.signature.hex() if self.signature else None
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TransactionInput':
+        signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+        return cls(
+            tx_id=data["tx_id"],
+            output_index=data["output_index"],
+            public_key=data.get("public_key"),
+            signature=signature
+        )
+
+class Transaction:
+    """Enhanced Transaction class with msgpack serialization."""
+    
+    def __init__(self, sender: str = None, recipient: str = None, amount: float = None,
+                 tx_type: TransactionType = TransactionType.TRANSFER,
+                 signature: Optional[bytes] = None,
+                 timestamp: Optional[str] = None,
+                 inputs: Optional[List[TransactionInput]] = None,
+                 outputs: Optional[List[TransactionOutput]] = None,
+                 fee: float = 0.0,
+                 nonce: int = None):
+                 
+        # Default values for all transaction types
+        self.nonce = nonce or int(time.time() * 1000)
+        
+        # Handle different transaction types
+        if sender == "0" and recipient is not None and amount is not None:
+            # Coinbase transaction
+            self.sender = "0"
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.signature = None
+            self.tx_type = TransactionType.COINBASE
+            self.fee = 0.0
+            self.inputs = []
+            self.outputs = [TransactionOutput(recipient=recipient, amount=amount)]
+            
+        elif sender is not None and recipient is not None and amount is not None:
+            # Simple transfer
+            self.sender = sender
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.signature = signature
+            self.tx_type = tx_type or TransactionType.TRANSFER
+            self.fee = fee
+            self.inputs = inputs or []
+            self.outputs = outputs or []
+            
+        else:
+            # UTXO-based transaction
+            self.inputs = inputs or []
+            self.outputs = outputs or []
+            self.tx_type = tx_type
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.fee = fee
+            self.sender = self.inputs[0].public_key if self.inputs else None
+            self.recipient = self.outputs[0].recipient if self.outputs else None
+            self.amount = sum(output.amount for output in self.outputs) if self.outputs else 0
+            self.signature = signature
+        
+        # Calculate transaction ID
+        self.tx_id = self.calculate_tx_id()
+    
+    def calculate_tx_id(self) -> str:
+        """Calculate transaction ID based on transaction details."""
+        try:
+            if self.inputs or self.tx_type == TransactionType.COINBASE:
+                # UTXO or coinbase transaction
+                data = {
+                    "tx_type": self.tx_type.value,
+                    "inputs": [i.to_dict() for i in self.inputs],
+                    "outputs": [o.to_dict() for o in self.outputs],
+                    "fee": self.fee,
+                    "timestamp": self.timestamp,
+                    "nonce": self.nonce
+                }
+                return sha256(msgpack.dumps(data))
+            else:
+                # Simple transfer
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}"
+                return sha256(message)
+        except Exception as e:
+            logger.error(f"Failed to calculate transaction ID: {e}")
+            raise
+    
+    def to_dict(self, exclude_signature: bool = False) -> Dict[str, Any]:
+        """Convert transaction to dictionary for serialization."""
+        try:
+            base_dict = {
+                "tx_id": self.tx_id,
+                "sender": self.sender,
+                "recipient": self.recipient,
+                "amount": self.amount,
+                "timestamp": self.timestamp,
+                "tx_type": self.tx_type.value,
+                "fee": self.fee,
+                "nonce": self.nonce
+            }
+            
+            if self.signature and not exclude_signature:
+                base_dict["signature"] = self.signature.hex()
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                base_dict["inputs"] = [i.to_dict() for i in self.inputs]
+            
+            if hasattr(self, 'outputs') and self.outputs:
+                base_dict["outputs"] = [o.to_dict() for o in self.outputs]
+            
+            return base_dict
+        except Exception as e:
+            logger.error(f"Failed to convert transaction to dict: {e}")
+            raise
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Transaction':
+        """Create transaction from dictionary data."""
+        try:
+            if "inputs" in data and "outputs" in data:
+                # UTXO-based transaction
+                tx_type = TransactionType(data["tx_type"])
+                inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
+                outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
+                signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+                
+                tx = cls(
+                    tx_type=tx_type,
+                    inputs=inputs,
+                    outputs=outputs,
+                    fee=data.get("fee", 0.0),
+                    nonce=data.get("nonce"),
+                    signature=signature,
+                    timestamp=data.get("timestamp")
+                )
+                
+                # Override tx_id if provided (for deserialization)
+                if "tx_id" in data:
+                    tx.tx_id = data["tx_id"]
+                
+                return tx
+            else:
+                # Simple transfer transaction
+                signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+                
+                tx = cls(
+                    sender=data['sender'],
+                    recipient=data['recipient'],
+                    amount=data['amount'],
+                    timestamp=data.get('timestamp'),
+                    signature=signature,
+                    tx_type=TransactionType(data.get('tx_type', 'transfer'))
+                )
+                
+                # Override tx_id if provided
+                if "tx_id" in data:
+                    tx.tx_id = data["tx_id"]
+                
+                return tx
+        except Exception as e:
+            logger.error(f"Failed to create transaction from dict: {e}")
+            raise
+    
+    async def sign(self, private_key):
+        """Sign the transaction with the sender's private key."""
+        try:
+            import ecdsa
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                # UTXO-based transaction signing
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                message = msgpack.dumps(self.to_dict(exclude_signature=True))
+                
+                # Sign in thread pool to avoid blocking
+                for input_tx in self.inputs:
+                    input_tx.signature = await asyncio.to_thread(lambda: sk.sign(message))
+            else:
+                # Simple transfer transaction signing
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                self.signature = await asyncio.to_thread(lambda: sk.sign(message))
+            
+            return self.signature
+        except Exception as e:
+            logger.error(f"Failed to sign transaction: {e}")
+            raise
+    
+    async def verify(self) -> bool:
+        """Verify transaction signature."""
+        try:
+            import ecdsa
+            
+            if self.tx_type == TransactionType.COINBASE:
+                return True
+            except Exception as e:
+                logger.error(f"Block validation failed for {block.index}: {e}")
+                return False
+    
+    async def add_block(self, block: Block) -> bool:
+        """Add a validated block to the blockchain."""
+        async with self._chain_lock:
+            try:
+                # Check if block already exists
+                if any(b.hash == block.hash for b in self.chain):
+                    logger.info(f"Block {block.index} already exists in chain")
+                    return False
+                
+                # Check if block fits at the end of current chain
+                if block.index == len(self.chain) and block.previous_hash == self.chain[-1].hash:
+                    # Validate block
+                    is_valid = await self.validate_block(block)
+                    if not is_valid:
+                        logger.warning(f"Block {block.index} failed validation")
+                        return False
+                    
+                    logger.info(f"Adding block {block.index} with hash {block.hash[:8]}")
+                    
+                    # Add block to chain
+                    self.chain.append(block)
+                    
+                    # Update UTXO set
+                    await self.utxo_set.update_with_block(block)
+                    
+                    # Check if we need to adjust difficulty
+                    if len(self.chain) % self.difficulty_adjust_interval == 0:
+                        self.adjust_difficulty()
+                    
+                    # Check if we need to halve block reward
+                    if len(self.chain) % self.halving_interval == 0:
+                        self.halve_block_reward()
+                    
+                    # Notify listeners
+                    self.trigger_event("new_block", block)
+                    
+                    # Save block to PostgreSQL
+                    await BlockchainStorage.store_block(block.to_dict())
+                    
+                    # Remove block's transactions from mempool
+                    tx_ids = [tx.tx_id for tx in block.transactions]
+                    await self.mempool.remove_transactions(tx_ids)
+                    
+                    logger.info(f"Successfully added block {block.index}, chain length: {len(self.chain)}")
+                    return True
+                else:
+                    logger.info(f"Block {block.index} doesn't follow chain tip, handling as potential fork")
+                    # In a full implementation, fork handling would go here
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to add block {block.index}: {e}")
+                return False
+    
+    def adjust_difficulty(self) -> int:
+        """Adjust mining difficulty based on block generation time."""
+        if len(self.chain) < 2 or len(self.chain) % self.difficulty_adjust_interval != 0:
+            return self.difficulty
+        
+        period_blocks = self.chain[-self.difficulty_adjust_interval:]
+        
+        # Parse timestamps and calculate time taken
+        try:
+            start_time = datetime.datetime.fromisoformat(period_blocks[0].timestamp)
+            end_time = datetime.datetime.fromisoformat(period_blocks[-1].timestamp)
+            time_taken = (end_time - start_time).total_seconds()
+        except ValueError:
+            # Handle numeric timestamps
+            time_taken = float(period_blocks[-1].timestamp) - float(period_blocks[0].timestamp)
+        
+        target_time = self.difficulty_adjust_interval * 600  # 10 minutes per block
+        
+        if time_taken > 0:
+            ratio = target_time / time_taken
+            
+            # Limit the adjustment to prevent wild swings
+            ratio = max(0.25, min(4.0, ratio))
+            
+            self.difficulty = max(1, min(20, int(self.difficulty * ratio)))
+            logger.info(f"Difficulty adjusted to {self.difficulty}")
+        
+        return self.difficulty
+    
+    def halve_block_reward(self) -> None:
+        """Halve the block mining reward."""
+        self.current_reward /= 2
+        logger.info(f"Block reward halved to {self.current_reward}")
+    
+    def get_latest_block(self) -> Optional[Block]:
+        """Get the latest block in the chain."""
+        return self.chain[-1] if self.chain else None
+    
+    async def create_transaction(self, sender_private_key: str, sender_address: str,
+                               recipient_address: str, amount: float, fee: float = 0.001) -> Optional[Transaction]:
+        """Create a new transaction."""
+        try:
+            # Get UTXOs for the sender
+            sender_utxos = await self.utxo_set.get_utxos_for_address(sender_address)
+            
+            # Calculate total available funds
+            total_available = sum(utxo[2].amount for utxo in sender_utxos)
+            
+            # Check if sender has enough funds
+            if total_available < amount + fee:
+                logger.warning(f"Insufficient funds: {total_available} < {amount + fee}")
+                return None
+            
+            # Select UTXOs for this transaction
+            selected_utxos = []
+            selected_amount = 0
+            
+            for tx_id, output_index, utxo in sender_utxos:
+                selected_utxos.append((tx_id, output_index, utxo.amount))
+                selected_amount += utxo.amount
+                if selected_amount >= amount + fee:
+                    break
+            
+            if selected_amount < amount + fee:
+                logger.warning("Not enough UTXOs to cover amount")
+                return None
+            
+            # Create key objects for signing
+            import ecdsa
+            sk = ecdsa.SigningKey.from_string(bytes.fromhex(sender_private_key), curve=ecdsa.SECP256k1)
+            public_key = sk.get_verifying_key().to_string().hex()
+            
+            # Create transaction inputs
+            inputs = [
+                TransactionInput(
+                    tx_id=tx_id,
+                    output_index=index,
+                    public_key=public_key
+                )
+                for tx_id, index, _ in selected_utxos
+            ]
+            
+            # Create transaction outputs
+            outputs = [TransactionOutput(recipient=recipient_address, amount=amount)]
+            
+            # Add change output if necessary
+            change = selected_amount - amount - fee
+            if change > 0:
+                outputs.append(TransactionOutput(recipient=sender_address, amount=change))
+            
+            # Create transaction with unique nonce
+            tx = Transaction(
+                tx_type=TransactionType.TRANSFER,
+                inputs=inputs,
+                outputs=outputs,
+                fee=fee,
+                nonce=int(time.time() * 1000)  # Millisecond timestamp as nonce
+            )
+            
+            # Sign transaction
+            await tx.sign(sender_private_key)
+            
+            return tx
+        except Exception as e:
+            logger.error(f"Failed to create transaction: {e}")
+            return None
+    
+    async def add_transaction_to_mempool(self, tx: Transaction) -> bool:
+        """Add a validated transaction to the mempool."""
+        async with self._mempool_lock:
+            # Validate transaction
+            if not await tx.verify():
+                return False
+            
+            # Add to mempool
+            success = await self.mempool.add_transaction(tx)
+            
+            if success:
+                # Notify listeners
+                self.trigger_event("new_transaction", tx)
+                
+                # Store transaction in PostgreSQL
+                await BlockchainStorage.store_transaction(tx.to_dict())
+                
+            return success
+    
+    async def get_balance(self, address: str) -> float:
+        """Get balance for an address from UTXO set."""
+        return await self.utxo_set.get_balance(address)
+    
+    async def create_wallet(self) -> str:
+        """Create a new wallet with public/private key pair."""
+        # Generate new key pair
+        import ecdsa
+        private_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+        public_key = private_key.get_verifying_key()
+        
+        # Convert to hex strings
+        private_key_hex = private_key.to_string().hex()
+        public_key_hex = public_key.to_string().hex()
+        
+        # Create address from public key
+        address = public_key_to_address(public_key_hex)
+        
+        # Store wallet
+        self.wallets[address] = {
+            'private_key': private_key_hex,
+            'public_key': public_key_hex
+        }
+        
+        # Save wallets to storage
+        await self.save_wallets()
+        
+        return address
+    
+    async def get_wallet(self, address: str) -> Optional[Dict[str, str]]:
+        """Get wallet information for an address."""
+        return self.wallets.get(address)
+    
+    async def get_all_addresses(self) -> List[str]:
+        """Return list of all wallet addresses in the blockchain."""
+        # Collect unique addresses from PostgreSQL
+        # In a full implementation, this would use a dedicated query
+        return list(self.wallets.keys())
+    
+    async def get_transactions_for_address(self, address: str) -> List[Transaction]:
+        """Get all transactions involving a specific address."""
+        tx_dicts = await BlockchainStorage.get_transactions_for_address(address)
+        return [Transaction.from_dict(tx_dict) for tx_dict in tx_dicts]
+    
+    def subscribe(self, event: str, callback: callable) -> None:
+        """Subscribe to blockchain events."""
+        if event in self.listeners:
+            self.listeners[event].append(callback)
+    
+    def trigger_event(self, event: str, data: Any) -> None:
+        """Trigger event callbacks."""
+        for callback in self.listeners[event]:
+            asyncio.create_task(self._async_callback(callback, data, event))
+    
+    async def _async_callback(self, callback: callable, data: Any, event: str) -> None:
+        """Execute callback asynchronously."""
+        try:
+            if asyncio.iscoroutinefunction(callback):
+                await callback(data)
+            else:
+                # Run synchronous callbacks in thread pool
+                await asyncio.to_thread(callback, data)
+        except Exception as e:
+            logger.error(f"Callback error for event {event}: {e}")
+    
+    async def start_mining(self, wallet_address: str) -> bool:
+        """Start the mining process."""
+        logger.info(f"Starting mining for wallet {wallet_address}")
+        
+        if not wallet_address:
+            logger.error("No wallet address set for mining")
+            return False
+        
+        # Get the latest block
+        latest_block = self.get_latest_block()
+        if not latest_block:
+            logger.error("Cannot start mining: blockchain has no blocks")
+            return False
+        
+        # Start a background task for mining
+        asyncio.create_task(self._mining_loop(wallet_address))
+        
+        return True
+    
+    async def _mining_loop(self, wallet_address: str) -> None:
+        """Main mining loop."""
+        logger.info(f"Mining loop started for {wallet_address}")
+        
+        try:
+            while True:
+                # Create a new block to mine
+                block = await self._create_block(wallet_address)
+                if not block:
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Mine the block using multiprocess miner
+                mining_result = await self.miner.mine_block(
+                    block_data=block.to_mineable_dict(),
+                    difficulty=self.difficulty
+                )
+                
+                if mining_result.get('success', False):
+                    # Update block with mining results
+                    block.nonce = mining_result['nonce']
+                    block.hash = mining_result['hash']
+                    
+                    # Add the mined block to the chain
+                    if await self.add_block(block):
+                        logger.info(f"Successfully mined and added block {block.index}")
+                    else:
+                        logger.warning(f"Block {block.index} was mined but not added to chain")
+                
+                # Small delay between mining attempts
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            logger.info("Mining loop cancelled")
+        except Exception as e:
+            logger.error(f"Mining error: {e}")
+    
+    async def _create_block(self, wallet_address: str) -> Optional[Block]:
+        """Create a new block to mine."""
+        try:
+            # Get the latest block
+            latest_block = self.get_latest_block()
+            if not latest_block:
+                logger.error("No latest block found")
+                return None
+            
+            # Get transactions from mempool
+            transactions = await self.mempool.get_transactions(1000, 1000000)
+            
+            # Create coinbase transaction (mining reward)
+            coinbase_tx = Transaction(
+                sender="0",
+                recipient=wallet_address,
+                amount=self.current_reward,
+                tx_type=TransactionType.COINBASE
+            )
+            
+            # Add coinbase as first transaction
+            transactions.insert(0, coinbase_tx)
+            
+            # Create the new block
+            block = Block(
+                index=latest_block.index + 1,
+                transactions=transactions,
+                previous_hash=latest_block.hash
+            )
+            
+            # Set difficulty
+            block.difficulty = self.difficulty
+            
+            # Calculate merkle root
+            block.calculate_merkle_root()
+            
+            return block
+        except Exception as e:
+            logger.error(f"Block creation error: {e}")
+            return None
+    
+    async def stop_mining(self) -> bool:
+        """Stop the mining process."""
+        # In a full implementation, this would cancel the mining task
+        # For now, we'll just return True
+        return True
+    
+    async def get_hashrate(self) -> float:
+        """Get current mining hashrate."""
+        stats = self.miner.get_stats()
+        return stats.get('hashrate', 0.0)
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                # UTXO-based transaction verification
+                message = msgpack.dumps(self.to_dict(exclude_signature=True))
+                tasks = []
+                
+                for input_tx in self.inputs:
+                    if not input_tx.signature or not input_tx.public_key:
+                        return False
+                
+                # Validate timestamp (not in future, after previous block)
+                if block.index > 0:
+                    prev_block = self.chain[block.index - 1]
+                    
+                    if isinstance(block.timestamp, str):
+                        # Parse ISO format timestamp
+                        try:
+                            block_time = datetime.datetime.fromisoformat(block.timestamp)
+                            prev_time = datetime.datetime.fromisoformat(prev_block.timestamp)
+                            
+                            if block_time <= prev_time:
+                                logger.warning(f"Block {block.index} timestamp not after previous block")
+                                return False
+                            
+                            if block_time > datetime.datetime.now() + datetime.timedelta(hours=2):
+                                logger.warning(f"Block {block.index} timestamp too far in future")
+                                return False
+                        except ValueError:
+                            logger.warning(f"Block {block.index} has invalid timestamp format")
+                            return False
+                
+                # Check for coinbase transaction
+                if not block.transactions or len(block.transactions) == 0:
+                    logger.warning(f"Block {block.index} has no transactions")
+                    return False
+                
+                if block.transactions[0].tx_type != TransactionType.COINBASE:
+                    logger.warning(f"Block {block.index} first transaction is not coinbase")
+                    return False
+                
+                # Validate coinbase reward
+                coinbase_amount = block.transactions[0].amount
+                if coinbase_amount > self.current_reward:
+                    logger.warning(f"Block {block.index} coinbase reward exceeds limit")
+                    return False
+                
+                # Check for double-spends within block
+                spent_utxos = set()
+                for tx in block.transactions[1:]:  # Skip coinbase
+                    if tx.tx_type == TransactionType.COINBASE:
+                        logger.warning(f"Block {block.index} has multiple coinbase transactions")
+                        return False
+                    
+                    # Check each input
+                    for tx_input in tx.inputs:
+                        utxo_key = (tx_input.tx_id, tx_input.output_index)
+                        if utxo_key in spent_utxos:
+                            logger.warning(f"Block {block.index} contains double-spend")
+                            return False
+                        spent_utxos.add(utxo_key)
+                
+                # Validate proof of work
+                target = "0" * block.difficulty
+                if not block.hash or not block.hash.startswith(target):
+                    logger.warning(f"Block {block.index} hash doesn't meet difficulty target")
+                    return False
+                
+                # Validate merkle root
+                calculated_merkle_root = calculate_merkle_root([tx.tx_id for tx in block.transactions])
+                if block.merkle_root != calculated_merkle_root:
+                    logger.warning(f"Block {block.index} has invalid merkle root")
+                    return False
+                
+                # Validate transaction signatures
+                for i, tx in enumerate(block.transactions):
+                    if not await tx.verify():
+                        logger.warning(f"Transaction {i} in block {block.index} failed signature verification")
+                        return False
+                
+                return True
+                    
+                    vk = ecdsa.VerifyingKey.from_string(
+                        bytes.fromhex(input_tx.public_key),
+                        curve=ecdsa.SECP256k1
+                    )
+                    
+                    tasks.append(
+                        asyncio.to_thread(
+                            lambda v=vk, s=input_tx.signature: v.verify(s, message)
+                        )
+                    )
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                return all(isinstance(r, bool) and r for r in results)
+            else:
+                # Simple transfer transaction verification
+                if not self.signature or not self.sender:
+                    return False
+                
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                
+                vk = ecdsa.VerifyingKey.from_string(
+                    bytes.fromhex(self.sender),
+                    curve=ecdsa.SECP256k1
+                )
+                
+                return await asyncio.to_thread(lambda: vk.verify(self.signature, message))
+        except Exception as e:
+            logger.error(f"Transaction verification failed: {e}")
+            return False
+
+class Block:
+    """Enhanced Block class with msgpack serialization and merkle tree."""
+    
+    def __init__(self, index: int, transactions: List[Transaction], previous_hash: str):
+        """Initialize a new block."""
+        self.index = index
+        self.timestamp = datetime.datetime.now().isoformat()
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.nonce = 0
+        self.difficulty = 4
+        self.merkle_root = "0" * 64
+        
+        # Calculate merkle root if transactions are provided
+        if transactions:
+            self.calculate_merkle_root()
+        
+        # Calculate hash after all properties are set
+        self.hash = self.calculate_hash()
+    
+    def calculate_merkle_root(self) -> str:
+        """Calculate the merkle root of the transactions."""
+        tx_ids = [tx.tx_id for tx in self.transactions]
+        self.merkle_root = calculate_merkle_root(tx_ids)
+        return self.merkle_root
+    
+    def calculate_hash(self) -> str:
+        """Calculate the hash of the block."""
+        block_string = (
+            f"{self.index}"
+            f"{self.timestamp}"
+            f"{msgpack.dumps([tx.to_dict() for tx in self.transactions])}"
+            f"{self.previous_hash}"
+            f"{self.nonce}"
+        )
+        return sha256(block_string)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert block to dictionary for serialization."""
+        return {
+            'index': self.index,
+            'timestamp': self.timestamp,
+            'transactions': [tx.to_dict() for tx in self.transactions],
+            'previous_hash': self.previous_hash,
+            'nonce': self.nonce,
+            'difficulty': self.difficulty,
+            'merkle_root': self.merkle_root,
+            'hash': self.hash
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Block':
+        """Create block from dictionary data."""
+        block = cls(
+            index=data['index'],
+            transactions=[],  # Empty list initially
+            previous_hash=data['previous_hash']
+        )
+        
+        # Restore other attributes
+        block.timestamp = data['timestamp']
+        block.nonce = data.get('nonce', 0)
+        block.hash = data['hash']
+        block.difficulty = data.get('difficulty', 4)
+        block.merkle_root = data.get('merkle_root', "0" * 64)
+        
+        # Restore transactions
+        block.transactions = [
+            Transaction.from_dict(tx) for tx in data.get('transactions', [])
+        ]
+        
+        return block
+    
+    def to_mineable_dict(self) -> Dict[str, Any]:
+        """Convert block to a dictionary format suitable for mining."""
+        try:
+            # Convert transactions to safe dictionaries
+            safe_transactions = []
+            for tx in self.transactions:
+                tx_dict = tx.to_dict()
+                # Ensure signature is properly encoded as hex string
+                if 'signature' in tx_dict and isinstance(tx_dict['signature'], bytes):
+                    tx_dict['signature'] = tx_dict['signature'].hex()
+                safe_transactions.append(tx_dict)
+            
+            # Create safe dictionary
+            return {
+                'index': self.index,
+                'timestamp': self.timestamp,
+                'transactions': safe_transactions,
+                'previous_hash': self.previous_hash,
+                'nonce': self.nonce,
+                'difficulty': self.difficulty,
+                'merkle_root': self.merkle_root
+            }
+        except Exception as e:
+            logger.error(f"Error in to_mineable_dict: {e}")
+            raise
+
+class UTXOSet:
+    """UTXO tracking with PostgreSQL backend."""
+    
+    def __init__(self):
+        self._lock = asyncio.Lock()
+    
+    async def update_with_block(self, block: Block):
+        """Update UTXO set with a new block."""
+        async with self._lock:
+            for tx in block.transactions:
+                # Add outputs to UTXO set
+                if tx.tx_type == TransactionType.COINBASE:
+                    # Coinbase transaction creates new UTXOs
+                    continue  # PostgreSQL handles this when storing the transaction
+                
+                # Mark inputs as spent - PostgreSQL handles this
+                pass  # PostgreSQL handles this when storing the transaction
+    
+    async def get_utxos_for_address(self, address: str) -> List[Tuple[str, int, TransactionOutput]]:
+        """Get all UTXOs for an address."""
+        utxos_data = await BlockchainStorage.get_utxos_for_address(address)
+        return [(utxo['tx_id'], utxo['output_index'], 
+                TransactionOutput(recipient=address, amount=utxo['amount']))
+               for utxo in utxos_data]
+    
+    async def get_balance(self, address: str) -> float:
+        """Calculate balance for an address."""
+        return await BlockchainStorage.get_balance(address)
+    
+    async def is_nonce_used(self, address: str, nonce: int) -> bool:
+        """Check if a nonce has been used for an address."""
+        # This would be implemented in PostgreSQL with a nonce tracking table
+        # For simplicity, we'll just check if any transactions with this nonce exist
+        # In a full implementation, this would use a dedicated nonce table
+        async with self._lock:
+            # TODO: Implement PostgreSQL nonce tracking
+            return False
+
+class Mempool:
+    """Transaction mempool with improved priority queue."""
+    
+    def __init__(self):
+        self.transactions: Dict[str, Transaction] = {}
+        self.timestamps: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+        self.max_size = int(os.getenv("MEMPOOL_MAX_SIZE", 1000))
+        self.max_age_seconds = int(os.getenv("MEMPOOL_MAX_AGE", 24 * 3600))
+    
+    async def add_transaction(self, tx: Transaction) -> bool:
+        """Add a transaction to the mempool."""
+        async with self._lock:
+            if not await tx.verify():
+                logger.warning(f"Transaction {tx.tx_id} failed verification")
+                return False
+            
+            if tx.tx_id not in self.transactions:
+                if len(self.transactions) >= self.max_size:
+                    # Prioritize transactions based on fee, size, and age
+                    now = time.time()
+                    tx_scores = {
+                        tx_id: (tx.fee / len(msgpack.dumps(tx.to_dict())) * 1000) / (now - self.timestamps[tx_id] + 1)
+                        for tx_id, tx in self.transactions.items()
+                    }
+                    lowest_score_tx = min(tx_scores, key=tx_scores.get)
+                    logger.info(f"Mempool full, dropping lowest-scoring tx {lowest_score_tx}")
+                    del self.transactions[lowest_score_tx]
+                    del self.timestamps[lowest_score_tx]
+                
+                self.transactions[tx.tx_id] = tx
+                self.timestamps[tx.tx_id] = time.time()
+                logger.debug(f"Added transaction {tx.tx_id} to mempool")
+                return True
+            return False
+    
+    async def get_transactions(self, max_txs: int, max_size: int) -> List[Transaction]:
+        """Get transactions from the mempool based on priority."""
+        async with self._lock:
+            now = time.time()
+            
+            # Remove expired transactions
+            expired = [tx_id for tx_id, ts in self.timestamps.items() 
+                      if now - ts > self.max_age_seconds]
+            for tx_id in expired:
+                logger.info(f"Removing expired transaction {tx_id} from mempool")
+                self.transactions.pop(tx_id, None)
+                self.timestamps.pop(tx_id, None)
+            
+            # Sort by fee (descending)
+            sorted_txs = sorted(
+                self.transactions.values(), 
+                key=lambda tx: tx.fee, 
+                reverse=True
+            )
+            
+            # Check max size
+            selected_txs = []
+            current_size = 0
+            
+            for tx in sorted_txs:
+                tx_size = len(msgpack.dumps(tx.to_dict()))
+                if current_size + tx_size <= max_size and len(selected_txs) < max_txs:
+                    selected_txs.append(tx)
+                    current_size += tx_size
+                if len(selected_txs) >= max_txs or current_size >= max_size:
+                    break
+            
+            return selected_txs
+    
+    async def remove_transactions(self, tx_ids: List[str]) -> None:
+        """Remove transactions from the mempool."""
+        async with self._lock:
+            for tx_id in tx_ids:
+                self.transactions.pop(tx_id, None)
+                self.timestamps.pop(tx_id, None)
+
+class KeyManager:
+    """Securely manages wallet keys with strong encryption and PostgreSQL storage."""
+    
+    def __init__(self, password: str = None):
+        self.password = password
+        # Salt is now stored in the database for each wallet
+    
+    async def derive_key(self, password: str, salt: bytes = None) -> Tuple[bytes, bytes]:
+        """Derive encryption key from password using PBKDF2."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        
+        if not salt:
+            salt = os.urandom(16)
+        
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key, salt
+    
+    async def encrypt_private_key(self, private_key: str, salt: bytes = None) -> Tuple[bytes, bytes]:
+        """Encrypt a private key."""
+        from cryptography.fernet import Fernet
+        
+        key, salt = await self.derive_key(self.password, salt)
+        f = Fernet(key)
+        encrypted = f.encrypt(private_key.encode())
+        return encrypted, salt
+    
+    async def decrypt_private_key(self, encrypted_key: bytes, salt: bytes) -> str:
+        """Decrypt a private key."""
+        from cryptography.fernet import Fernet
+        
+        key, _ = await self.derive_key(self.password, salt)
+        f = Fernet(key)
+        return f.decrypt(encrypted_key).decode()
+    
+    async def save_keys(self, wallets: Dict[str, Dict[str, str]]) -> bool:
+        """Save encrypted wallet keys to PostgreSQL."""
+        try:
+            for address, wallet in wallets.items():
+                encrypted_private_key, salt = await self.encrypt_private_key(wallet['private_key'])
+                
+                # Store with PostgreSQL
+                await BlockchainStorage.store_wallet(
+                    address=address,
+                    public_key=wallet['public_key'],
+                    encrypted_private_key=base64.b64encode(encrypted_private_key).decode()
+                )
+            
+            logger.info(f"Saved {len(wallets)} encrypted wallets to PostgreSQL")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save encrypted keys: {e}")
+            return False
+    
+    async def load_keys(self) -> Dict[str, Dict[str, str]]:
+        """Load and decrypt wallet keys from PostgreSQL."""
+        try:
+            # In a full implementation, salts would be stored with each wallet
+            wallets_data = await BlockchainStorage.get_all_wallets()
+            
+            wallets = {}
+            for wallet_data in wallets_data:
+                encrypted_key = base64.b64decode(wallet_data['encrypted_private_key'])
+                
+                # For simplicity, we're using a fixed salt per user session
+                # In a full implementation, the salt would be stored with each wallet
+                salt = hashlib.sha256(wallet_data['address'].encode()).digest()[:16]
+                
+                try:
+                    private_key = await self.decrypt_private_key(encrypted_key, salt)
+                except Exception as e:
+                    raise ValueError("Incorrect password for wallet decryption") from e
+                
+                wallets[wallet_data['address']] = {
+                    'public_key': wallet_data['public_key'],
+                    'private_key': private_key
+                }
+            
+            logger.info(f"Loaded {len(wallets)} encrypted wallets from PostgreSQL")
+            return wallets
+        except Exception as e:
+            logger.error(f"Failed to load keys: {e}")
+            raise
+
+class EnhancedBlockchain:
+    """Enhanced blockchain implementation with PostgreSQL, msgpack, and C++ acceleration."""
+    
+    def __init__(self, node_id: str = None, wallet_password: str = None, port: Optional[int] = None):
+        """Initialize the blockchain."""
+        # Set up logging
+        self._logger = logging.getLogger(f"Blockchain-{node_id or 'default'}")
+        
+        # Basic properties
+        self.initialized = False
+        self._initializing = False
+        self.node_id = node_id or "default"
+        self.port = port
+        
+        # Configuration
+        self.difficulty = int(os.getenv("INITIAL_DIFFICULTY", 4))
+        self.current_reward = float(os.getenv("INITIAL_REWARD", 50.0))
+        self.halving_interval = int(os.getenv("HALVING_INTERVAL", 210000))
+        self.difficulty_adjust_interval = int(os.getenv("DIFFICULTY_ADJUST_INTERVAL", 10))
+        
+        # Chain state
+        self.chain: List[Block] = []
+        self.mempool = Mempool()
+        self.utxo_set = UTXOSet()
+        
+        # Security
+        self.key_manager = KeyManager(password=wallet_password)
+        self.wallets = {}
+        
+        # Concurrency controls
+        self._chain_lock = asyncio.Lock()
+        self._mempool_lock = asyncio.Lock()
+        
+        # Event system
+        self.listeners = {"new_block": [], "new_transaction": []}
+        
+        # Mining
+        self.miner = MultiprocessMiner(use_gpu=True)
+    
+    async def initialize(self):
+        """Initialize the blockchain database and load chain."""
+        if self._initializing:
+            return
+        
+        self._initializing = True
+        
+        try:
+            # Initialize PostgreSQL database
+            await initialize_database()
+            
+            # Load existing chain
+            await self.load_chain()
+            await self.load_wallets()
+            
+            if not self.chain:
+                self.create_genesis_block()
+                await self.save_chain()
+            
+            # Start mining
+            self.miner.start()
+            
+            # Set initialized flag
+            self.initialized = True
+            logger.info(f"Blockchain initialized with {len(self.chain)} blocks")
+        except Exception as e:
+            logger.error(f"Failed to initialize blockchain: {e}")
+            raise
+        finally:
+            self._initializing = False
+    
+    async def shutdown(self):
+        """Safely shut down the blockchain."""
+        try:
+            # Stop mining
+            self.miner.stop()
+            
+            # Save chain and wallets
+            await self.save_chain()
+            await self.key_manager.save_keys(self.wallets)
+            
+            logger.info("Blockchain shut down successfully")
+        except Exception as e:
+            logger.error(f"Error during blockchain shutdown: {e}")
+            raise
+    
+    async def load_chain(self):
+        """Load blockchain from PostgreSQL."""
+        try:
+            # Get the latest block to determine chain length
+            latest_block = await BlockchainStorage.get_latest_block()
+            
+            if latest_block:
+                # Load full chain
+                blocks_data = await BlockchainStorage.get_blocks(0, latest_block['index'] + 1)
+                self.chain = [Block.from_dict(block_data) for block_data in blocks_data]
+                logger.info(f"Loaded {len(self.chain)} blocks from PostgreSQL")
+            else:
+                logger.info("No existing chain found in PostgreSQL")
+                self.chain = []
+        except Exception as e:
+            logger.error(f"Failed to load chain from PostgreSQL: {e}")
+            self.chain = []
+        
+        # Create genesis block if chain is empty
+        if not self.chain:
+            self.create_genesis_block()
+            await self.save_chain()
+    
+    def create_genesis_block(self):
+        """Create the genesis block."""
+        if self.chain:
+            logger.info("Chain already exists, skipping genesis block creation")
+            return self.chain[0]
+        
+        genesis_tx = Transaction(
+            sender="0",
+            recipient="genesis",
+            amount=0,
+            tx_type=TransactionType.COINBASE
+        )
+        
+        genesis_block = Block(
+            index=0,
+            transactions=[genesis_tx],
+            previous_hash="0"
+        )
+        
+        if not self.chain:
+            self.chain.append(genesis_block)
+        
+        return genesis_block
+    
+    async def save_chain(self):
+        """Save chain to PostgreSQL."""
+        try:
+            for block in self.chain:
+                await BlockchainStorage.store_block(block.to_dict())
+            logger.info(f"Saved {len(self.chain)} blocks to PostgreSQL")
+        except Exception as e:
+            logger.error(f"Failed to save chain: {e}")
+            raise
+    
+    async def load_wallets(self):
+        """Load wallets from PostgreSQL."""
+        try:
+            self.wallets = await self.key_manager.load_keys()
+            if self.wallets:
+                logger.info(f"Loaded {len(self.wallets)} wallets from PostgreSQL")
+        except ValueError as e:
+            if "Incorrect password" in str(e):
+                raise ValueError("Incorrect wallet password provided") from e
+            else:
+                raise
+    
+    async def save_wallets(self):
+        """Save wallets to PostgreSQL."""
+        try:
+            await self.key_manager.save_keys(self.wallets)
+            logger.info(f"Saved {len(self.wallets)} wallets to PostgreSQL")
+        except Exception as e:
+            logger.error(f"Failed to save wallets: {e}")
+            raise
+    
+    async def validate_block(self, block: Block) -> bool:
+        """Validate block against consensus rules."""
+        async with self._chain_lock:
+            try:
+                logger.info(f"Starting validation for block {block.index}")
+                
+                # Check block is properly linked to chain
+                if block.index > 0:
+                    if block.index > len(self.chain):
+                        logger.info(f"Block {block.hash[:8]} index {block.index} exceeds chain length {len(self.chain)}")
+                        return False
+                    
+                    prev_block = self.chain[block.index - 1]
+                    if block.previous_hash != prev_block.hash:
+                        logger.warning(f"Block {block.index} has incorrect previous_hash")
+                        return False"""
+Enhanced Blockchain implementation with PostgreSQL, msgpack, and C++ acceleration.
+"""
+
+import os
+import sys
+import asyncio
+import logging
+import time
+import datetime
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
+import uuid
+import base64
+import hashlib
+import json
+import msgpack
+from enum import Enum
+from dataclasses import dataclass, field, asdict
+
+# Import acceleration modules
+from cpp_utils import (
+    sha256,
+    calculate_merkle_root,
+    public_key_to_address
+)
+
+# Import storage and serialization
+from postgres_storage import BlockchainStorage, initialize_database
+from msgpack_serializer import serialize, deserialize, serialize_block, deserialize_block
+
+# Import mining worker
+from mining_worker import MultiprocessMiner
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# From utils.py, maintain TransactionType enum
+class TransactionType(Enum):
+    """Enum representing types of transactions."""
+    COINBASE = "coinbase"
+    TRANSFER = "transfer"
+
+@dataclass
+class TransactionOutput:
+    """Represents an output in a transaction."""
+    recipient: str
+    amount: float
+    script: str = "P2PKH"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "recipient": self.recipient,
+            "amount": self.amount,
+            "script": self.script
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TransactionOutput':
+        return cls(
+            recipient=data["recipient"],
+            amount=data["amount"],
+            script=data.get("script", "P2PKH")
+        )
+
+@dataclass
+class TransactionInput:
+    """Represents an input in a transaction."""
+    tx_id: str
+    output_index: int
+    public_key: Optional[str] = None
+    signature: Optional[bytes] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tx_id": self.tx_id,
+            "output_index": self.output_index,
+            "public_key": self.public_key,
+            "signature": self.signature.hex() if self.signature else None
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'TransactionInput':
+        signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+        return cls(
+            tx_id=data["tx_id"],
+            output_index=data["output_index"],
+            public_key=data.get("public_key"),
+            signature=signature
+        )
+
+class Transaction:
+    """Enhanced Transaction class with msgpack serialization."""
+    
+    def __init__(self, sender: str = None, recipient: str = None, amount: float = None,
+                 tx_type: TransactionType = TransactionType.TRANSFER,
+                 signature: Optional[bytes] = None,
+                 timestamp: Optional[str] = None,
+                 inputs: Optional[List[TransactionInput]] = None,
+                 outputs: Optional[List[TransactionOutput]] = None,
+                 fee: float = 0.0,
+                 nonce: int = None):
+                 
+        # Default values for all transaction types
+        self.nonce = nonce or int(time.time() * 1000)
+        
+        # Handle different transaction types
+        if sender == "0" and recipient is not None and amount is not None:
+            # Coinbase transaction
+            self.sender = "0"
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.signature = None
+            self.tx_type = TransactionType.COINBASE
+            self.fee = 0.0
+            self.inputs = []
+            self.outputs = [TransactionOutput(recipient=recipient, amount=amount)]
+            
+        elif sender is not None and recipient is not None and amount is not None:
+            # Simple transfer
+            self.sender = sender
+            self.recipient = recipient
+            self.amount = amount
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.signature = signature
+            self.tx_type = tx_type or TransactionType.TRANSFER
+            self.fee = fee
+            self.inputs = inputs or []
+            self.outputs = outputs or []
+            
+        else:
+            # UTXO-based transaction
+            self.inputs = inputs or []
+            self.outputs = outputs or []
+            self.tx_type = tx_type
+            self.timestamp = timestamp or datetime.datetime.now().isoformat()
+            self.fee = fee
+            self.sender = self.inputs[0].public_key if self.inputs else None
+            self.recipient = self.outputs[0].recipient if self.outputs else None
+            self.amount = sum(output.amount for output in self.outputs) if self.outputs else 0
+            self.signature = signature
+        
+        # Calculate transaction ID
+        self.tx_id = self.calculate_tx_id()
+    
+    def calculate_tx_id(self) -> str:
+        """Calculate transaction ID based on transaction details."""
+        try:
+            if self.inputs or self.tx_type == TransactionType.COINBASE:
+                # UTXO or coinbase transaction
+                data = {
+                    "tx_type": self.tx_type.value,
+                    "inputs": [i.to_dict() for i in self.inputs],
+                    "outputs": [o.to_dict() for o in self.outputs],
+                    "fee": self.fee,
+                    "timestamp": self.timestamp,
+                    "nonce": self.nonce
+                }
+                return sha256(msgpack.dumps(data))
+            else:
+                # Simple transfer
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}"
+                return sha256(message)
+        except Exception as e:
+            logger.error(f"Failed to calculate transaction ID: {e}")
+            raise
+    
+    def to_dict(self, exclude_signature: bool = False) -> Dict[str, Any]:
+        """Convert transaction to dictionary for serialization."""
+        try:
+            base_dict = {
+                "tx_id": self.tx_id,
+                "sender": self.sender,
+                "recipient": self.recipient,
+                "amount": self.amount,
+                "timestamp": self.timestamp,
+                "tx_type": self.tx_type.value,
+                "fee": self.fee,
+                "nonce": self.nonce
+            }
+            
+            if self.signature and not exclude_signature:
+                base_dict["signature"] = self.signature.hex()
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                base_dict["inputs"] = [i.to_dict() for i in self.inputs]
+            
+            if hasattr(self, 'outputs') and self.outputs:
+                base_dict["outputs"] = [o.to_dict() for o in self.outputs]
+            
+            return base_dict
+        except Exception as e:
+            logger.error(f"Failed to convert transaction to dict: {e}")
+            raise
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Transaction':
+        """Create transaction from dictionary data."""
+        try:
+            if "inputs" in data and "outputs" in data:
+                # UTXO-based transaction
+                tx_type = TransactionType(data["tx_type"])
+                inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
+                outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
+                signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+                
+                tx = cls(
+                    tx_type=tx_type,
+                    inputs=inputs,
+                    outputs=outputs,
+                    fee=data.get("fee", 0.0),
+                    nonce=data.get("nonce"),
+                    signature=signature,
+                    timestamp=data.get("timestamp")
+                )
+                
+                # Override tx_id if provided (for deserialization)
+                if "tx_id" in data:
+                    tx.tx_id = data["tx_id"]
+                
+                return tx
+            else:
+                # Simple transfer transaction
+                signature = bytes.fromhex(data["signature"]) if data.get("signature") else None
+                
+                tx = cls(
+                    sender=data['sender'],
+                    recipient=data['recipient'],
+                    amount=data['amount'],
+                    timestamp=data.get('timestamp'),
+                    signature=signature,
+                    tx_type=TransactionType(data.get('tx_type', 'transfer'))
+                )
+                
+                # Override tx_id if provided
+                if "tx_id" in data:
+                    tx.tx_id = data["tx_id"]
+                
+                return tx
+        except Exception as e:
+            logger.error(f"Failed to create transaction from dict: {e}")
+            raise
+    
+    async def sign(self, private_key):
+        """Sign the transaction with the sender's private key."""
+        try:
+            import ecdsa
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                # UTXO-based transaction signing
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                message = msgpack.dumps(self.to_dict(exclude_signature=True))
+                
+                # Sign in thread pool to avoid blocking
+                for input_tx in self.inputs:
+                    input_tx.signature = await asyncio.to_thread(lambda: sk.sign(message))
+            else:
+                # Simple transfer transaction signing
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key), curve=ecdsa.SECP256k1)
+                self.signature = await asyncio.to_thread(lambda: sk.sign(message))
+            
+            return self.signature
+        except Exception as e:
+            logger.error(f"Failed to sign transaction: {e}")
+            raise
+    
+    async def verify(self) -> bool:
+        """Verify transaction signature."""
+        try:
+            import ecdsa
+            
+            if self.tx_type == TransactionType.COINBASE:
+                return True
+            
+            if hasattr(self, 'inputs') and self.inputs:
+                # UTXO-based transaction verification
+                message = msgpack.dumps(self.to_dict(exclude_signature=True))
+                tasks = []
+                
+                for input_tx in self.inputs:
+                    if not input_tx.signature or not input_tx.public_key:
+                        return False
+                    
+                    vk = ecdsa.VerifyingKey.from_string(
+                        bytes.fromhex(input_tx.public_key),
+                        curve=ecdsa.SECP256k1
+                    )
+                    
+                    tasks.append(
+                        asyncio.to_thread(
+                            lambda v=vk, s=input_tx.signature: v.verify(s, message)
+                        )
+                    )
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                return all(isinstance(r, bool) and r for r in results)
+            else:
+                # Simple transfer transaction verification
+                if not self.signature or not self.sender:
+                    return False
+                
+                message = f"{self.sender}{self.recipient}{self.amount}{self.timestamp}".encode()
+                
+                vk = ecdsa.VerifyingKey.from_string(
+                    bytes.fromhex(self.sender),
+                    curve=ecdsa.SECP256k1
+                )
+                
+                return await asyncio.to_thread(lambda: vk.verify(self.signature, message))
+        except Exception as e:
+            logger.error(f"Transaction verification failed: {e}")
+            return False

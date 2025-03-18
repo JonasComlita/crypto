@@ -1,0 +1,173 @@
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <curand_kernel.h>
+#include <stdio.h>
+#include <string>
+#include <vector>
+
+// CUDA kernel for SHA-256 computation (simplified)
+__device__ void sha256_transform(uint32_t* state, const uint32_t* block) {
+    // This is a simplified placeholder for the SHA-256 implementation
+    // In a real implementation, this would contain the full SHA-256 algorithm
+    
+    // Constants for SHA-256
+    const uint32_t k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        // ... remaining constants would be here
+    };
+    
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
+    
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = block[i];
+    }
+    
+    // Extend the first 16 words into the remaining 48 words
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = (w[i-15] >> 7 | w[i-15] << 25) ^ (w[i-15] >> 18 | w[i-15] << 14) ^ (w[i-15] >> 3);
+        uint32_t s1 = (w[i-2] >> 17 | w[i-2] << 15) ^ (w[i-2] >> 19 | w[i-2] << 13) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    
+    // Main loop
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = (e >> 6 | e << 26) ^ (e >> 11 | e << 21) ^ (e >> 25 | e << 7);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t temp1 = h + S1 + ch + k[i] + w[i];
+        uint32_t S0 = (a >> 2 | a << 30) ^ (a >> 13 | a << 19) ^ (a >> 22 | a << 10);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temp2 = S0 + maj;
+        
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+    
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
+
+// CUDA kernel for mining
+__global__ void mine_kernel(char* block_header, int block_header_len, int difficulty, int start_nonce, int* result_nonce, char* result_hash, int* found) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nonce = start_nonce + idx;
+    
+    // Create a copy of the block header
+    char local_header[256]; // Assuming header size is less than 256
+    for (int i = 0; i < block_header_len; i++) {
+        local_header[i] = block_header[i];
+    }
+    
+    // Append nonce
+    char nonce_str[16];
+    int nonce_len = sprintf(nonce_str, "%d", nonce);
+    for (int i = 0; i < nonce_len; i++) {
+        local_header[block_header_len + i] = nonce_str[i];
+    }
+    local_header[block_header_len + nonce_len] = '\0';
+    
+    // Prepare for SHA-256
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    
+    // Simplified block preparation (in real implementation, we would properly pad the message)
+    uint32_t block[16] = {0};
+    for (int i = 0; i < (block_header_len + nonce_len) / 4; i++) {
+        block[i] = (local_header[i*4] << 24) | (local_header[i*4+1] << 16) |
+                   (local_header[i*4+2] << 8) | local_header[i*4+3];
+    }
+    
+    // Compute hash
+    sha256_transform(state, block);
+    
+    // Check if hash meets difficulty requirement
+    char hash[65];
+    for (int i = 0; i < 8; i++) {
+        sprintf(&hash[i*8], "%08x", state[i]);
+    }
+    hash[64] = '\0';
+    
+    // Check leading zeros against difficulty
+    bool valid = true;
+    for (int i = 0; i < difficulty; i++) {
+        if (hash[i] != '0') {
+            valid = false;
+            break;
+        }
+    }
+    
+    // If valid, store result
+    if (valid && atomicExch(found, 1) == 0) {
+        *result_nonce = nonce;
+        for (int i = 0; i < 65; i++) {
+            result_hash[i] = hash[i];
+        }
+    }
+}
+
+// Host function to launch the CUDA kernel
+extern "C" bool cuda_mine_block(const char* block_header, int difficulty, int max_nonce, int* result_nonce, char* result_hash) {
+    int block_header_len = strlen(block_header);
+    char* d_block_header;
+    int* d_result_nonce;
+    char* d_result_hash;
+    int* d_found;
+    
+    // Allocate device memory
+    cudaMalloc(&d_block_header, block_header_len + 1);
+    cudaMalloc(&d_result_nonce, sizeof(int));
+    cudaMalloc(&d_result_hash, 65); // SHA-256 hash is 64 chars + null terminator
+    cudaMalloc(&d_found, sizeof(int));
+    
+    // Copy data to device
+    cudaMemcpy(d_block_header, block_header, block_header_len + 1, cudaMemcpyHostToDevice);
+    cudaMemset(d_found, 0, sizeof(int));
+    
+    // Configure kernel
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (max_nonce + threadsPerBlock - 1) / threadsPerBlock;
+    
+    // Launch kernel
+    mine_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_block_header, block_header_len, difficulty, 0, d_result_nonce, d_result_hash, d_found);
+    
+    // Wait for kernel to complete
+    cudaDeviceSynchronize();
+    
+    // Check if solution was found
+    int found;
+    cudaMemcpy(&found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    if (found) {
+        cudaMemcpy(result_nonce, d_result_nonce, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(result_hash, d_result_hash, 65, cudaMemcpyDeviceToHost);
+    }
+    
+    // Free device memory
+    cudaFree(d_block_header);
+    cudaFree(d_result_nonce);
+    cudaFree(d_result_hash);
+    cudaFree(d_found);
+    
+    return found != 0;
+}

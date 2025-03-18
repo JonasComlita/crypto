@@ -1,0 +1,200 @@
+// blockchain_cpp.cpp - C++ Acceleration Library for Blockchain Operations
+// Compiles to a shared library that can be called from Python
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <future>
+#include <random>
+#include <functional>
+#include <chrono>
+#include <algorithm>
+#include <condition_variable>
+
+namespace py = pybind11;
+
+// Forward declarations
+std::string sha256(const std::string& input);
+std::string calculate_merkle_root(const std::vector<std::string>& tx_ids);
+std::tuple<int, std::string, long> mine_block(const std::string& block_string_base, int difficulty, int max_nonce);
+std::string public_key_to_address(const std::string& public_key);
+
+// SHA-256 implementation using OpenSSL
+std::string sha256(const std::string& input) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    SHA256_Update(&sha256, input.c_str(), input.length());
+    SHA256_Final(hash, &sha256);
+    
+    std::stringstream ss;
+    for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    }
+    return ss.str();
+}
+
+// Calculate Merkle root with optimized C++ implementation
+std::string calculate_merkle_root(const std::vector<std::string>& tx_ids) {
+    if (tx_ids.empty()) {
+        return std::string(64, '0');
+    }
+    
+    std::vector<std::string> tree = tx_ids;
+    while (tree.size() > 1) {
+        std::vector<std::string> new_level;
+        for (size_t i = 0; i < tree.size(); i += 2) {
+            std::string left = tree[i];
+            std::string right = (i + 1 < tree.size()) ? tree[i + 1] : left;
+            std::string combined = left + right;
+            new_level.push_back(sha256(combined));
+        }
+        tree = new_level;
+    }
+    return tree[0];
+}
+
+// Multithreaded mining implementation
+std::tuple<int, std::string, long> mine_block(const std::string& block_string_base, int difficulty, int max_nonce = INT_MAX) {
+    std::string target(difficulty, '0');
+    
+    // Use a thread pool based on hardware concurrency
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4; // Fallback if hardware_concurrency is not supported
+    
+    // Atomic variables for thread synchronization
+    std::atomic<bool> found_solution(false);
+    std::atomic<int> result_nonce(0);
+    std::atomic<long> total_hashes(0);
+    std::string result_hash;
+    std::mutex result_mutex;
+    
+    // Divide the nonce space into chunks for each thread
+    std::vector<std::thread> threads;
+    int chunk_size = max_nonce / num_threads;
+    
+    for (unsigned int i = 0; i < num_threads; i++) {
+        int start_nonce = i * chunk_size;
+        int end_nonce = (i == num_threads - 1) ? max_nonce : (i + 1) * chunk_size;
+        
+        threads.emplace_back([&, start_nonce, end_nonce]() {
+            long local_hashes = 0;
+            for (int nonce = start_nonce; nonce < end_nonce && !found_solution; nonce++) {
+                std::string block_string = block_string_base + std::to_string(nonce);
+                std::string hash = sha256(block_string);
+                local_hashes++;
+                
+                if (hash.compare(0, difficulty, target) == 0) {
+                    std::lock_guard<std::mutex> lock(result_mutex);
+                    if (!found_solution) {
+                        found_solution = true;
+                        result_nonce = nonce;
+                        result_hash = hash;
+                    }
+                    break;
+                }
+                
+                // Update hash count every 10000 hashes
+                if (local_hashes % 10000 == 0) {
+                    total_hashes += local_hashes;
+                    local_hashes = 0;
+                }
+            }
+            total_hashes += local_hashes;
+        });
+    }
+    
+    // Join all threads
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    
+    if (found_solution) {
+        return std::make_tuple(result_nonce, result_hash, total_hashes.load());
+    } else {
+        return std::make_tuple(-1, "", total_hashes.load());
+    }
+}
+
+// Convert public key to blockchain address
+std::string public_key_to_address(const std::string& public_key) {
+    // SHA-256 hashing
+    std::string sha256_hash = sha256(public_key);
+    
+    // RIPEMD-160 hashing using OpenSSL EVP
+    unsigned char ripemd160_hash[EVP_MAX_MD_SIZE];
+    unsigned int md_len;
+    
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_ripemd160(), nullptr);
+    EVP_DigestUpdate(ctx, sha256_hash.c_str(), sha256_hash.length());
+    EVP_DigestFinal_ex(ctx, ripemd160_hash, &md_len);
+    EVP_MD_CTX_free(ctx);
+    
+    // Convert to hex string
+    std::stringstream ss;
+    for(unsigned int i = 0; i < md_len && i < 10; i++) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)ripemd160_hash[i];
+    }
+    
+    return "1" + ss.str();
+}
+
+// GPU Mining support class using CUDA
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+
+class GPUMiner {
+public:
+    GPUMiner() {
+        initialize();
+    }
+    
+    ~GPUMiner() {
+        shutdown();
+    }
+    
+    std::tuple<int, std::string, long> mine(const std::string& block_string_base, int difficulty, int max_nonce) {
+        // Implementation details would depend on CUDA code
+        // This is a placeholder for the actual CUDA implementation
+        // In a real implementation, we would call into CUDA kernels here
+        
+        // Placeholder return
+        return std::make_tuple(-1, "", 0);
+    }
+
+private:
+    void initialize() {
+        // Initialize CUDA resources
+    }
+    
+    void shutdown() {
+        // Clean up CUDA resources
+    }
+};
+#endif
+
+// Define the Python module
+PYBIND11_MODULE(blockchain_cpp, m) {
+    m.doc() = "C++ acceleration library for blockchain operations";
+    
+    m.def("sha256", &sha256, "Calculate SHA-256 hash of input string");
+    m.def("calculate_merkle_root", &calculate_merkle_root, "Calculate Merkle root from transaction IDs");
+    m.def("mine_block", &mine_block, "Mine a block with the given difficulty",
+          py::arg("block_string_base"), py::arg("difficulty"), py::arg("max_nonce") = INT_MAX);
+    m.def("public_key_to_address", &public_key_to_address, "Convert public key to blockchain address");
+    
+#ifdef WITH_CUDA
+    py::class_<GPUMiner>(m, "GPUMiner")
+        .def(py::init<>())
+        .def("mine", &GPUMiner::mine, "Mine a block using GPU acceleration");
+#endif
+}

@@ -1,0 +1,92 @@
+"""
+Multiprocessing mining worker module.
+Provides dedicated mining processes that communicate via pipes.
+"""
+
+import os
+import time
+import logging
+import multiprocessing as mp
+from multiprocessing import Process, Queue, Event, Pipe
+from multiprocessing.connection import Connection
+import msgpack
+import ctypes
+import asyncio
+from typing import Dict, Any, Optional, List, Tuple, Union
+import signal
+import sys
+import traceback
+
+# Import CPU and/or GPU acceleration if available
+try:
+    from cpp_utils import mine_block as cpp_mine_block
+    from cpp_utils import sha256 as cpp_sha256
+    from cpp_utils import GPU_AVAILABLE
+    CPP_AVAILABLE = True
+except ImportError:
+    # Fallback to pure Python
+    import hashlib
+    CPP_AVAILABLE = False
+    GPU_AVAILABLE = False
+    
+    def cpp_sha256(data):
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    def cpp_mine_block(block_string_base, difficulty, max_nonce):
+        # Pure Python mining implementation (slower)
+        target = "0" * difficulty
+        for nonce in range(max_nonce):
+            block_string = f"{block_string_base}{nonce}"
+            block_hash = hashlib.sha256(block_string.encode()).hexdigest()
+            if block_hash.startswith(target):
+                return nonce, block_hash, nonce + 1
+        return -1, "", max_nonce
+
+logger = logging.getLogger(__name__)
+
+# Shared statistics for mining workers
+class MiningStats:
+    """Shared memory statistics for mining workers."""
+    def __init__(self):
+        self.total_hashes = mp.Value(ctypes.c_ulonglong, 0)
+        self.current_hashrate = mp.Value(ctypes.c_double, 0.0)
+        self.blocks_mined = mp.Value(ctypes.c_uint, 0)
+        self.active_workers = mp.Value(ctypes.c_uint, 0)
+        self.last_block_time = mp.Value(ctypes.c_double, time.time())
+        self.lock = mp.Lock()
+        
+    def update_hashrate(self, hashes: int, duration: float):
+        """Update the current hashrate."""
+        with self.lock:
+            self.total_hashes.value += hashes
+            if duration > 0:
+                # Exponential moving average
+                new_rate = hashes / duration
+                self.current_hashrate.value = 0.7 * self.current_hashrate.value + 0.3 * new_rate
+    
+    def increment_blocks(self):
+        """Increment the blocks mined counter."""
+        with self.lock:
+            self.blocks_mined.value += 1
+            self.last_block_time.value = time.time()
+    
+    def add_worker(self):
+        """Add an active worker."""
+        with self.lock:
+            self.active_workers.value += 1
+    
+    def remove_worker(self):
+        """Remove an active worker."""
+        with self.lock:
+            if self.active_workers.value > 0:
+                self.active_workers.value -= 1
+    
+    def get_stats(self) -> Dict[str, Union[int, float]]:
+        """Get current mining statistics."""
+        with self.lock:
+            return {
+                'total_hashes': self.total_hashes.value,
+                'hashrate': self.current_hashrate.value,
+                'blocks_mined': self.blocks_mined.value,
+                'active_workers': self.active_workers.value,
+                'last_block_time': self.last_block_time
